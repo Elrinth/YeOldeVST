@@ -17,6 +17,29 @@ It comes in three flavours, all in the same file:
 Every flavour also has a MIDI output, which carries whatever the hosted plugin sends
 (arpeggiators, MIDI generators).
 
+## Screenshots
+
+The plugin browser: your scanned VST2 plugins with their test results. Copies of the same plugin
+are grouped (here Ample Guitar, 32- and 64-bit) and expand to one row per file.
+
+![The plugin browser](docs/images/browser.png)
+
+A 64-bit plugin loaded in-process, with the preset picker in the toolbar:
+
+![OB-Xd in YeOldeVST](docs/images/editor-64bit.png)
+
+A 32-bit plugin running in the 32-bit helper process, its editor embedded in the same window:
+
+![TAL-NoiseMaker, 32-bit, bridged](docs/images/editor-32bit-bridged.png)
+
+The generic editor, for plugins without an editor of their own (or with a broken one), and on
+Linux, a native Linux VST2 in the Dear ImGui version of the window:
+
+<p>
+<img src="docs/images/generic.png" alt="Generic slider editor" width="45%">
+<img src="docs/images/linux.png" alt="Dragonfly Room Reverb on Linux" width="53%">
+</p>
+
 ## Features
 
 - **Plugin browser.** Add your VST2 folders, scan them, then search and filter the results
