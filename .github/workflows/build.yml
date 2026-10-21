@@ -20,7 +20,7 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Only the submodules the build needs; vst3sdk's vstgui4, doc and tutorials are skipped.
       - name: Fetch submodules
@@ -110,7 +110,7 @@ jobs:
           "zip=$zip" >> $env:GITHUB_OUTPUT
           "name=$name-win64" >> $env:GITHUB_OUTPUT
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.package.outputs.name }}
           path: dist/${{ steps.package.outputs.name }}.zip
@@ -125,8 +125,10 @@ jobs:
           $tag = $env:GITHUB_REF_NAME
           $v = "${{ steps.version.outputs.version }}"
           $zip = "${{ steps.package.outputs.zip }}"
-          gh release view $tag 2>$null | Out-Null
+          $draft = gh release view $tag --json isDraft -q .isDraft 2>$null
           if ($LASTEXITCODE -eq 0) {
+            # Never replace the zip of a release that is already published.
+            if ($draft -ne 'true') { throw "release $tag is already published" }
             gh release upload $tag $zip --clobber
           } else {
             gh release create $tag $zip --draft --verify-tag --title "YeOldeVST $v" --notes "YeOldeVST $v for Windows 64-bit."
@@ -141,7 +143,7 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Fetch submodules
         run: |
