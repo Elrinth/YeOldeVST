@@ -460,6 +460,8 @@ void Gui::createControls() {
                                              LVS_EX_HEADERDRAGDROP | LVS_EX_LABELTIP);
   SetWindowTheme(lv_, L"DarkMode_Explorer", nullptr);
   if (HWND hdr = ListView_GetHeader(lv_)) SetWindowTheme(hdr, L"DarkMode_ItemsView", nullptr);
+  // The header reports its drawing to the list view, not to us: catch it there.
+  SetWindowSubclass(lv_, listSubclass, 1, (DWORD_PTR)this);
   ListView_SetBkColor(lv_, kPanel);
   ListView_SetTextBkColor(lv_, kPanel);
   ListView_SetTextColor(lv_, kText);
@@ -1179,12 +1181,24 @@ void Gui::paintPage(HDC dc, const RECT& rc) {
   }
 }
 
+LRESULT CALLBACK Gui::listSubclass(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR ref) {
+  if (m == WM_NOTIFY) {
+    auto nm = reinterpret_cast<NMHDR*>(l);
+    if (nm->code == NM_CUSTOMDRAW && nm->hwndFrom == ListView_GetHeader(h))
+      return reinterpret_cast<Gui*>(ref)->headerCustomDraw(reinterpret_cast<NMCUSTOMDRAW*>(l));
+  } else if (m == WM_NCDESTROY) {
+    RemoveWindowSubclass(h, listSubclass, 1);
+  }
+  return DefSubclassProc(h, m, w, l);
+}
+
 LRESULT Gui::headerCustomDraw(NMCUSTOMDRAW* cd) {
   if (cd->dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
   if (cd->dwDrawStage == CDDS_ITEMPREPAINT) {
     HDC dc = cd->hdc;
     RECT r = cd->rc;
-    fillRect(dc, r, kCtrl);
+    bool hot = (cd->uItemState & (CDIS_HOT | CDIS_SELECTED)) != 0;
+    fillRect(dc, r, hot ? kCtrlHot : kCtrl);
     RECT sep{r.right - 1, r.top + S(4), r.right, r.bottom - S(4)};
     fillRect(dc, sep, kBorder);
     wchar_t text[64] = {};
@@ -1196,7 +1210,7 @@ LRESULT Gui::headerCustomDraw(NMCUSTOMDRAW* cd) {
     std::wstring t = text;
     if ((int)cd->dwItemSpec == sortColumn_) t += sortAscending_ ? L"  \u25B4" : L"  \u25BE";
     r.left += S(6);
-    drawText(dc, t, r, kDim, fontBold_, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    drawText(dc, t, r, kText, fontBold_, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     return CDRF_SKIPDEFAULT;
   }
   return CDRF_DODEFAULT;
