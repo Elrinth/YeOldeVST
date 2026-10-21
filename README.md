@@ -62,6 +62,9 @@ instances share them.
 
 ## Installing
 
+Download `YeOldeVST-1.0.0-win64.zip` from the
+[Releases page](https://github.com/Elrinth/YeOldeVST/releases) and unpack it.
+
 Copy `YeOldeVST.clap` to `%LOCALAPPDATA%\Programs\Common\CLAP` or
 `C:\Program Files\Common Files\CLAP`. Copy the `YeOldeVST.vst3` folder to
 `%LOCALAPPDATA%\Programs\Common\VST3` or `C:\Program Files\Common Files\VST3`.
@@ -71,7 +74,7 @@ Copy `YeOldeVST.clap` to `%LOCALAPPDATA%\Programs\Common\CLAP` or
 You need Visual Studio 2022 (with the x86 and x64 C++ tools) and CMake 3.21 or newer.
 
 ```
-git clone --recursive ssh://forgejo@forgejo.thefirstboss.com:2222/elrinth/YeOldeVST.git
+git clone --recursive https://github.com/Elrinth/YeOldeVST.git
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
 ```
@@ -167,3 +170,10 @@ These are the main source files:
   in-process or sandboxed (none in testing did).
 - VST3 hosts show parameter names only after a plugin is loaded. They update when you load another
   plugin, because the VST3 wrapper rebuilds the parameter list.
+
+## License
+
+YeOldeVST is released under the [MIT License](LICENSE). It includes CLAP, clap-wrapper and the
+VST 3 SDK, all MIT licensed; see [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt).
+
+VST is a registered trademark of Steinberg Media Technologies GmbH.

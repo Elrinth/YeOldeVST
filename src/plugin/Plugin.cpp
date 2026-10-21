@@ -14,7 +14,7 @@ using namespace vst2;
 
 namespace yov {
 
-static const char* kVersion = "0.1.0";
+static const char* kVersion = "1.0.0";
 
 Shared& Shared::get() {
   static Shared* s = [] {
@@ -38,7 +38,7 @@ static const clap_plugin_descriptor_t kInstrumentDesc = {
     "com.thefirstboss.yeoldevst.instrument",
     "YeOldeVST Instrument",
     "Elrinth",
-    "https://forgejo.thefirstboss.com/elrinth/YeOldeVST",
+    "https://github.com/Elrinth/YeOldeVST",
     "",
     "",
     kVersion,
@@ -51,7 +51,7 @@ static const clap_plugin_descriptor_t kEffectDesc = {
     "com.thefirstboss.yeoldevst.effect",
     "YeOldeVST Effect",
     "Elrinth",
-    "https://forgejo.thefirstboss.com/elrinth/YeOldeVST",
+    "https://github.com/Elrinth/YeOldeVST",
     "",
     "",
     kVersion,
@@ -64,7 +64,7 @@ static const clap_plugin_descriptor_t kInstrumentMultiDesc = {
     "com.thefirstboss.yeoldevst.instrument.multiout",
     "YeOldeVST Instrument (multi-out)",
     "Elrinth",
-    "https://forgejo.thefirstboss.com/elrinth/YeOldeVST",
+    "https://github.com/Elrinth/YeOldeVST",
     "",
     "",
     kVersion,
