@@ -21,23 +21,22 @@ namespace yov {
 
 namespace {
 
-// ---- palette ----
-constexpr COLORREF kBg = RGB(0x1C, 0x1D, 0x21);
-constexpr COLORREF kPanel = RGB(0x25, 0x27, 0x2C);
-constexpr COLORREF kCtrl = RGB(0x2F, 0x32, 0x38);
-constexpr COLORREF kCtrlHot = RGB(0x3A, 0x3D, 0x45);
-constexpr COLORREF kBorder = RGB(0x40, 0x43, 0x4A);
-constexpr COLORREF kText = RGB(0xE3, 0xE5, 0xE8);
-constexpr COLORREF kDim = RGB(0x95, 0x9A, 0xA4);
-constexpr COLORREF kAccent = RGB(0xD9, 0xA4, 0x41);  // old brass
-constexpr COLORREF kAccentText = RGB(0x1C, 0x1D, 0x21);
-constexpr COLORREF kOk = RGB(0x5C, 0xC7, 0x6E);
-constexpr COLORREF kWarn = RGB(0xE8, 0xBB, 0x3A);
-constexpr COLORREF kBad = RGB(0xEB, 0x5B, 0x52);
-constexpr COLORREF kGrey = RGB(0x7C, 0x81, 0x8A);
-constexpr COLORREF kBlue = RGB(0x6C, 0xB4, 0xEE);
-constexpr COLORREF kRowAlt = RGB(0x22, 0x24, 0x29);
-constexpr COLORREF kSelect = RGB(0x4A, 0x3E, 0x24);
+// ---- palette (plugin/BrowserModel.h) ----
+constexpr COLORREF C(uint32_t rgb) { return RGB((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF); }
+constexpr COLORREF kBg = C(palette::kBg);
+constexpr COLORREF kPanel = C(palette::kPanel);
+constexpr COLORREF kCtrl = C(palette::kCtrl);
+constexpr COLORREF kCtrlHot = C(palette::kCtrlHot);
+constexpr COLORREF kBorder = C(palette::kBorder);
+constexpr COLORREF kText = C(palette::kText);
+constexpr COLORREF kDim = C(palette::kDim);
+constexpr COLORREF kAccent = C(palette::kAccent);
+constexpr COLORREF kAccentText = C(palette::kAccentText);
+constexpr COLORREF kBad = C(palette::kBad);
+constexpr COLORREF kWarn = C(palette::kWarn);
+constexpr COLORREF kGrey = C(palette::kGrey);
+constexpr COLORREF kRowAlt = C(palette::kRowAlt);
+constexpr COLORREF kSelect = C(palette::kSelect);
 
 enum : int {
   ID_BROWSE = 100,
@@ -70,14 +69,6 @@ enum : int {
 constexpr UINT_PTR kTimerId = 1;
 constexpr int kToolbarH = 40;
 constexpr int kGenericRowH = 26;
-
-enum Filter { F_ALL, F_WORKING, F_PROBLEMS, F_INSTRUMENTS, F_EFFECTS, F_32BIT, F_OTHER, F_COUNT };
-const wchar_t* kFilterNames[F_COUNT] = {L"All plugins",      L"Working",           L"Problems",
-                                        L"Instruments",      L"Effects",           L"32-bit only",
-                                        L"Not VST2 / other"};
-
-const wchar_t* kColumns[] = {L"Name", L"Vendor", L"Type", L"Bits", L"Status", L"Editor", L"Details", L"File"};
-const int kColWidths[] = {230, 130, 90, 52, 76, 74, 280, 360};
 
 std::wstring classSuffix() {
   // Unique per module: the CLAP and VST3 builds may both be loaded in one process.
@@ -131,33 +122,6 @@ void registerClasses() {
 
 std::wstring W(const std::string& s) { return widen(s); }
 
-const wchar_t* statusLabel(ScanStatus s) {
-  switch (s) {
-    case ScanStatus::Ok: return L"OK";
-    case ScanStatus::Warning: return L"Warning";
-    case ScanStatus::Crashed: return L"Crashed";
-    case ScanStatus::Timeout: return L"Hangs";
-    case ScanStatus::LoadFailed: return L"Won't load";
-    case ScanStatus::NotPlugin: return L"Not VST2";
-    case ScanStatus::Unsupported: return L"Unsupported";
-    case ScanStatus::NoHelper: return L"Needs helper";
-    case ScanStatus::Shell: return L"Shell";
-    default: return L"Not scanned";
-  }
-}
-
-COLORREF statusColor(ScanStatus s) {
-  switch (s) {
-    case ScanStatus::Ok: return kOk;
-    case ScanStatus::Warning: return kWarn;
-    case ScanStatus::Crashed:
-    case ScanStatus::Timeout:
-    case ScanStatus::LoadFailed: return kBad;
-    case ScanStatus::NoHelper: return kBlue;
-    default: return kGrey;
-  }
-}
-
 void fillRect(HDC dc, const RECT& r, COLORREF c) {
   SetDCBrushColor(dc, c);
   FillRect(dc, &r, (HBRUSH)GetStockObject(DC_BRUSH));
@@ -179,38 +143,6 @@ void drawText(HDC dc, const std::wstring& s, RECT r, COLORREF c, HFONT f, UINT f
   SetBkMode(dc, TRANSPARENT);
   DrawTextW(dc, s.c_str(), (int)s.size(), &r, fmt | DT_NOPREFIX);
   SelectObject(dc, of);
-}
-
-// Suggest the usual VST2 folders that exist on this machine.
-std::vector<std::string> defaultVstFolders() {
-  std::vector<std::string> out;
-  auto add = [&](const std::string& p) {
-    if (p.empty() || !dirExists(p)) return;
-    for (auto& o : out)
-      if (foldCase(o) == foldCase(p)) return;
-    out.push_back(p);
-  };
-  for (HKEY root : {HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER}) {
-    for (REGSAM view : {KEY_WOW64_64KEY, KEY_WOW64_32KEY}) {
-      HKEY k;
-      if (RegOpenKeyExW(root, L"SOFTWARE\\VST", 0, KEY_READ | view, &k) == ERROR_SUCCESS) {
-        wchar_t buf[1024];
-        DWORD sz = sizeof buf, type = 0;
-        if (RegQueryValueExW(k, L"VSTPluginsPath", nullptr, &type, (LPBYTE)buf, &sz) == ERROR_SUCCESS &&
-            (type == REG_SZ || type == REG_EXPAND_SZ)) {
-          buf[std::min<DWORD>(sz / 2, 1023)] = 0;
-          add(trim(narrow(buf)));
-        }
-        RegCloseKey(k);
-      }
-    }
-  }
-  for (const char* p : {"C:\\Program Files\\VstPlugins", "C:\\Program Files\\Steinberg\\VstPlugins",
-                        "C:\\Program Files\\Common Files\\VST2", "C:\\Program Files\\Common Files\\Steinberg\\VST2",
-                        "C:\\Program Files (x86)\\VstPlugins", "C:\\Program Files (x86)\\Steinberg\\VstPlugins",
-                        "C:\\Program Files (x86)\\Common Files\\VST2"})
-    add(p);
-  return out;
 }
 
 // Removes windows a plugin left in the editor host after effEditClose. Only our own thread's
@@ -450,7 +382,7 @@ void Win32Gui::createControls() {
   SendMessageW(edtSearch_, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search name, vendor, file...");
   SendMessageW(edtSearch_, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(S(6), S(6)));
   cmbFilter_ = combo(page_, ID_FILTER);
-  for (auto f : kFilterNames) SendMessageW(cmbFilter_, CB_ADDSTRING, 0, (LPARAM)f);
+  for (auto f : kFilterNames) SendMessageW(cmbFilter_, CB_ADDSTRING, 0, (LPARAM)W(f).c_str());
   SendMessageW(cmbFilter_, CB_SETCURSEL, plugin_.isInstrument() ? F_INSTRUMENTS : F_EFFECTS, 0);
 
   lv_ = CreateWindowExW(0, WC_LISTVIEWW, L"",
@@ -467,11 +399,12 @@ void Win32Gui::createControls() {
   ListView_SetBkColor(lv_, kPanel);
   ListView_SetTextBkColor(lv_, kPanel);
   ListView_SetTextColor(lv_, kText);
-  for (int i = 0; i < (int)std::size(kColumns); ++i) {
+  for (int i = 0; i < kColumnCount; ++i) {
     LVCOLUMNW c{};
+    std::wstring name = W(kColumnNames[i]);
     c.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
-    c.pszText = (LPWSTR)kColumns[i];
-    c.cx = S(kColWidths[i]);
+    c.pszText = name.data();
+    c.cx = S(kColumnWidths[i]);
     c.iSubItem = i;
     ListView_InsertColumn(lv_, i, &c);
   }
@@ -809,189 +742,25 @@ void Win32Gui::startScan(bool rescanAll, bool retryFailed, const std::vector<std
 }
 
 void Win32Gui::refreshList() {
-  auto all = Shared::get().db.all();
   int filter = (int)SendMessageW(cmbFilter_, CB_GETCURSEL, 0, 0);
   wchar_t sbuf[256] = {};
   GetWindowTextW(edtSearch_, sbuf, 256);
-  std::string search = foldCase(trim(narrow(sbuf)));
   // Remember the selected row so it stays selected after the rebuild (scans refresh often).
-  std::string selId;
-  {
-    int sel = ListView_GetNextItem(lv_, -1, LVNI_SELECTED);
-    if (sel >= 0 && sel < (int)rows_.size()) {
-      auto& g = groups_[rows_[sel].group];
-      selId = g.key + "#" + (rows_[sel].member < 0 ? std::string() : g.recs[rows_[sel].member].key());
-    }
-  }
-  std::vector<PluginRecord> shown;
-  for (auto& r : all) {
-    if (r.status == ScanStatus::Shell) continue;
-    bool other = r.status == ScanStatus::NotPlugin || r.status == ScanStatus::Unsupported;
-    switch (filter) {
-      case F_ALL: if (other) continue; break;
-      case F_WORKING: if (!statusLoadable(r.status)) continue; break;
-      case F_PROBLEMS: if (!statusAngry(r.status) && r.status != ScanStatus::Warning && r.status != ScanStatus::NoHelper) continue; break;
-      case F_INSTRUMENTS: if (other || !r.isInstrument()) continue; break;
-      case F_EFFECTS: if (other || r.isInstrument() || r.status == ScanStatus::LoadFailed) continue; break;
-      case F_32BIT: if (other || r.arch != "x86") continue; break;
-      case F_OTHER: if (!other) continue; break;
-    }
-    if (!search.empty()) {
-      std::string hay = foldCase(r.displayName() + " " + r.vendor + " " + r.path);
-      if (hay.find(search) == std::string::npos) continue;
-    }
-    shown.push_back(r);
-  }
-
-  // Group copies of the same plugin (same name + vendor). Files that aren't plugins stay alone.
-  groups_.clear();
-  std::map<std::string, size_t> index;
-  for (auto& r : shown) {
-    bool other = r.status == ScanStatus::NotPlugin || r.status == ScanStatus::Unsupported;
-    std::string key = other ? "file|" + foldCase(r.path) + "|" + std::to_string(r.shellId)
-                            : foldCase(r.displayName()) + "|" + foldCase(r.vendor);
-    auto it = index.find(key);
-    if (it == index.end()) {
-      index[key] = groups_.size();
-      groups_.push_back({key, {r}, 0});
-    } else {
-      groups_[it->second].recs.push_back(r);
-    }
-  }
-  // The copy "Load" uses: working beats warning beats the rest; 64-bit beats 32-bit.
-  auto rank = [](const PluginRecord& r) {
-    int s = r.status == ScanStatus::Ok ? 0 : r.status == ScanStatus::Warning ? 2 : 10 + (int)r.status;
-    return s + (r.arch == "x64" ? 0 : 1);
-  };
-  for (auto& g : groups_) {
-    std::sort(g.recs.begin(), g.recs.end(),
-              [](const PluginRecord& a, const PluginRecord& b) { return foldCase(a.path) < foldCase(b.path); });
-    for (size_t i = 1; i < g.recs.size(); ++i)
-      if (rank(g.recs[i]) < rank(g.recs[g.best])) g.best = (int)i;
-  }
-
-  auto key = [&](const Group& g) -> std::string {
-    const PluginRecord& r = g.recs[g.best];
-    switch (sortColumn_) {
-      case 1: return foldCase(r.vendor);
-      case 2: return r.isInstrument() ? "a" : "b";
-      case 3: return r.arch;
-      case 4: return std::to_string((int)r.status);
-      case 5: return r.editor;
-      case 6: return foldCase(r.detail);
-      case 7: return foldCase(r.path);
-      default: return foldCase(r.displayName());
-    }
-  };
-  std::stable_sort(groups_.begin(), groups_.end(), [&](const Group& a, const Group& b) {
-    auto ka = key(a), kb = key(b);
-    if (ka == kb) return foldCase(a.recs[a.best].displayName()) < foldCase(b.recs[b.best].displayName());
-    return sortAscending_ ? ka < kb : ka > kb;
-  });
-
-  rows_.clear();
-  int newSel = -1;
-  for (int g = 0; g < (int)groups_.size(); ++g) {
-    auto rowId = [&](int m) {
-      return groups_[g].key + "#" + (m < 0 ? std::string() : groups_[g].recs[m].key());
-    };
-    if (groups_[g].recs.size() == 1) {
-      if (rowId(0) == selId) newSel = (int)rows_.size();
-      rows_.push_back({g, 0});
-      continue;
-    }
-    if (rowId(-1) == selId) newSel = (int)rows_.size();
-    rows_.push_back({g, -1});
-    if (expanded_.count(groups_[g].key))
-      for (int m = 0; m < (int)groups_[g].recs.size(); ++m) {
-        if (rowId(m) == selId) newSel = (int)rows_.size();
-        rows_.push_back({g, m});
-      }
-  }
-  ListView_SetItemCountEx(lv_, (int)rows_.size(), LVSICF_NOSCROLL);
+  std::string selId = model_.rowId(ListView_GetNextItem(lv_, -1, LVNI_SELECTED));
+  int newSel = model_.rebuild(Shared::get().db.all(), filter, narrow(sbuf), selId);
+  ListView_SetItemCountEx(lv_, model_.rowCount(), LVSICF_NOSCROLL);
   ListView_SetItemState(lv_, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
   if (newSel >= 0) ListView_SetItemState(lv_, newSel, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
   InvalidateRect(lv_, nullptr, FALSE);
   if (page_) InvalidateRect(page_, &statusRect_, TRUE);
 }
 
-const PluginRecord* Win32Gui::rowRecord(int row) const {
-  if (row < 0 || row >= (int)rows_.size()) return nullptr;
-  auto& g = groups_[rows_[row].group];
-  return &g.recs[rows_[row].member < 0 ? g.best : rows_[row].member];
-}
-
-bool Win32Gui::rowIsGroup(int row) const { return row >= 0 && row < (int)rows_.size() && rows_[row].member < 0; }
-
 void Win32Gui::toggleGroup(int row) {
-  if (!rowIsGroup(row)) return;
-  auto& key = groups_[rows_[row].group].key;
-  if (!expanded_.erase(key)) expanded_.insert(key);
+  if (!model_.rowIsGroup(row)) return;
+  model_.toggle(row);
   ListView_SetItemState(lv_, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
   ListView_SetItemState(lv_, row, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
   refreshList();
-}
-
-static std::wstring editorLabel(const PluginRecord& r) {
-  if (r.editor == "ok") return L"OK";
-  if (r.editor == "none" || (!r.hasEditor && statusLoadable(r.status))) return L"—";
-  if (r.editor == "crashed") return L"Crashed";
-  if (r.editor == "hangs") return L"Hangs";
-  if (r.editor == "failed") return L"Failed";
-  return (r.hasEditor && statusLoadable(r.status)) ? L"not tested" : L"";
-}
-
-std::wstring Win32Gui::cellText(int row, int col) const {
-  if (row < 0 || row >= (int)rows_.size()) return {};
-  const Group& g = groups_[rows_[row].group];
-  const bool header = rows_[row].member < 0;
-  const bool child = !header && g.recs.size() > 1;
-  const PluginRecord& rec = *rowRecord(row);
-  const bool other = rec.status == ScanStatus::NotPlugin || rec.status == ScanStatus::LoadFailed ||
-                     rec.status == ScanStatus::Unsupported;
-  switch (col) {
-    case 0:
-      if (header) return (expanded_.count(g.key) ? L"▾  " : L"▸  ") + W(rec.displayName());
-      if (child) return L"        " + W(fileNameOf(rec.path));
-      return W(rec.displayName());
-    case 1: return child ? std::wstring() : W(rec.vendor);
-    case 2: return other || child ? std::wstring() : (rec.isInstrument() ? L"Instrument" : L"Effect");
-    case 3: {
-      if (header) {
-        bool b32 = false, b64 = false;
-        for (auto& r : g.recs) (r.arch == "x86" ? b32 : b64) = true;
-        return b32 && b64 ? L"32+64" : b32 ? L"32" : L"64";
-      }
-      return rec.arch == "x86" ? L"32" : rec.arch == "x64" ? L"64" : W(rec.arch);
-    }
-    case 4: return statusLabel(rec.status);
-    case 5: {
-      if (!header) return editorLabel(rec);
-      std::wstring first;
-      bool same = true, any = false;
-      for (auto& r : g.recs) {
-        if (!statusLoadable(r.status)) continue;
-        auto l = editorLabel(r);
-        if (!any) first = l;
-        else if (l != first) same = false;
-        any = true;
-      }
-      return any ? (same ? first : L"mixed") : std::wstring();
-    }
-    case 6: {
-      if (!header) return W(rec.detail);
-      int ok = 0, bad = 0;
-      for (auto& r : g.recs) {
-        if (statusLoadable(r.status)) ++ok;
-        else ++bad;
-      }
-      wchar_t b[128];
-      swprintf(b, 128, L"%d files: %d work, %d with problems", (int)g.recs.size(), ok, bad);
-      return b;
-    }
-    case 7: return header ? W(dirOf(rec.path)) : W(rec.path);
-  }
-  return {};
 }
 
 void Win32Gui::refreshPrograms() {
@@ -1023,7 +792,7 @@ void Win32Gui::refreshScanStatus() {
 
 void Win32Gui::loadSelected(bool sandboxed) {
   // A group row loads its best copy (working, preferably 64-bit); expand it to pick another.
-  if (const PluginRecord* r = rowRecord(ListView_GetNextItem(lv_, -1, LVNI_SELECTED))) loadRecord(*r, sandboxed);
+  if (const PluginRecord* r = model_.rowRecord(ListView_GetNextItem(lv_, -1, LVNI_SELECTED))) loadRecord(*r, sandboxed);
 }
 
 void Win32Gui::loadRecord(const PluginRecord& r, bool sandboxed) {
@@ -1033,17 +802,12 @@ void Win32Gui::loadRecord(const PluginRecord& r, bool sandboxed) {
                 MB_OK | MB_ICONINFORMATION);
     return;
   }
-  bool bridged = sandboxed || r.arch == "x86";
-  if (statusAngry(r.status) || r.status == ScanStatus::Unknown) {
-    std::string msg = r.displayName() + " had a problem when it was tested:\n\n" +
-                      (r.detail.empty() ? std::string("it has not been tested yet") : r.detail) + "\n\n";
-    msg += bridged ? "It will run in a separate process, so if it crashes your DAW keeps running. Load it anyway?"
-                   : "Loading it straight into your DAW could crash the DAW. Load it sandboxed (in a separate "
-                     "process) instead?\n\nYes = sandboxed, No = load directly anyway, Cancel = don't load";
-    int res = MessageBoxW(owner, W(msg).c_str(), L"YeOldeVST",
-                          (bridged ? MB_OKCANCEL : MB_YESNOCANCEL) | MB_ICONWARNING | MB_DEFBUTTON1);
+  LoadQuestion q = loadQuestion(r, sandboxed);
+  if (!q.text.empty()) {
+    int res = MessageBoxW(owner, W(q.text).c_str(), L"YeOldeVST",
+                          (q.offerSandbox ? MB_YESNOCANCEL : MB_OKCANCEL) | MB_ICONWARNING | MB_DEFBUTTON1);
     if (res == IDCANCEL) return;
-    if (!bridged && res == IDYES) sandboxed = true;
+    if (q.offerSandbox && res == IDYES) sandboxed = true;
   }
   SetCursor(LoadCursorW(nullptr, IDC_WAIT));
   std::string err;
@@ -1058,10 +822,10 @@ void Win32Gui::loadRecord(const PluginRecord& r, bool sandboxed) {
 
 void Win32Gui::showContextMenu(int x, int y) {
   int sel = ListView_GetNextItem(lv_, -1, LVNI_SELECTED);
-  const PluginRecord* rp = rowRecord(sel);
+  const PluginRecord* rp = model_.rowRecord(sel);
   if (!rp) return;
   const PluginRecord r = *rp;
-  const bool group = rowIsGroup(sel);
+  const bool group = model_.rowIsGroup(sel);
   const bool busy = Shared::get().scanner.running();
   HMENU m = CreatePopupMenu();
   std::wstring loadText = group ? L"Load best copy (" + W(fileNameOf(r.path)) + L")" : std::wstring(L"Load");
@@ -1069,7 +833,7 @@ void Win32Gui::showContextMenu(int x, int y) {
   AppendMenuW(m, MF_STRING, ID_CTX_LOAD_SANDBOXED, L"Load sandboxed (separate process)");
   AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
   if (group) {
-    bool open = expanded_.count(groups_[rows_[sel].group].key) != 0;
+    bool open = model_.rowExpanded(sel);
     AppendMenuW(m, MF_STRING, ID_CTX_TOGGLE, open ? L"Collapse" : L"Show all copies");
     AppendMenuW(m, MF_STRING | (busy ? MF_GRAYED : 0), ID_CTX_RESCAN, L"Test all copies again");
   } else {
@@ -1086,7 +850,7 @@ void Win32Gui::showContextMenu(int x, int y) {
     case ID_CTX_RESCAN: {
       std::vector<std::string> files;
       if (group)
-        for (auto& c : groups_[rows_[sel].group].recs) files.push_back(c.path);
+        for (auto& c : model_.rowGroup(sel)->recs) files.push_back(c.path);
       else
         files.push_back(r.path);
       startScan(false, false, files);
@@ -1315,24 +1079,7 @@ void Win32Gui::paintPage(HDC dc, const RECT& rc) {
 
   // status line + progress
   auto& p = lastProgress_;
-  std::wstring status;
-  if (p.running) {
-    wchar_t b[256];
-    swprintf(b, 256, L"Testing %d of %d   \u2022   %d OK   \u2022   %d with problems", p.done, p.total, p.ok, p.angry);
-    status = b;
-    if (!p.current.empty()) status += L"   \u2022   " + W(fileNameOf(p.current.front()));
-  } else if (!p.message.empty()) {
-    status = W(p.message);
-  } else {
-    int ok = 0, bad = 0;
-    for (auto& r : Shared::get().db.all()) {
-      if (statusLoadable(r.status)) ++ok;
-      if (statusAngry(r.status)) ++bad;
-    }
-    wchar_t b[200];
-    swprintf(b, 200, L"%d plugins work, %d have problems. Double-click a plugin to load it.", ok, bad);
-    status = b;
-  }
+  std::wstring status = W(scanStatusLine(p, Shared::get().db));
   drawText(dc, status, statusRect_, p.running ? kText : kDim, font_, DT_LEFT | DT_VCENTER | DT_SINGLELINE |
                                                                          DT_END_ELLIPSIS);
   if (p.running && p.total > 0) {
@@ -1370,7 +1117,7 @@ LRESULT Win32Gui::headerCustomDraw(NMCUSTOMDRAW* cd) {
     item.cchTextMax = 64;
     Header_GetItem(cd->hdr.hwndFrom, (int)cd->dwItemSpec, &item);
     std::wstring t = text;
-    if ((int)cd->dwItemSpec == sortColumn_) t += sortAscending_ ? L"  \u25B4" : L"  \u25BE";
+    if ((int)cd->dwItemSpec == model_.sortColumn) t += model_.sortAscending ? L"  \u25B4" : L"  \u25BE";
     r.left += S(6);
     drawText(dc, t, r, kText, fontBold_, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     return CDRF_SKIPDEFAULT;
@@ -1392,25 +1139,9 @@ LRESULT Win32Gui::listCustomDraw(NMLVCUSTOMDRAW* cd) {
     }
     case CDDS_ITEMPREPAINT | CDDS_SUBITEM: {
       int row = (int)cd->nmcd.dwItemSpec;
-      const PluginRecord* rp = rowRecord(row);
-      if (!rp) return CDRF_DODEFAULT;
-      auto& r = *rp;
-      const bool group = rowIsGroup(row);
-      SelectObject(cd->nmcd.hdc, group ? fontBold_ : font_);
-      cd->clrText = kText;
-      if (cd->iSubItem == 4) {
-        cd->clrText = statusColor(r.status);
-      } else if (cd->iSubItem == 5) {
-        auto t = cellText(row, 5);
-        cd->clrText = t == L"OK" ? kOk : (t == L"Crashed" || t == L"Hangs" || t == L"Failed") ? kBad
-                      : t == L"mixed"                                                       ? kWarn
-                                                                                            : kDim;
-      } else if (cd->iSubItem == 3 && cellText(row, 3) != L"64") {
-        cd->clrText = kBlue;
-      } else if (cd->iSubItem >= 6 || cd->iSubItem == 1 || cd->iSubItem == 2) {
-        cd->clrText = kDim;
-      }
-      if (r.status == ScanStatus::NotPlugin || r.status == ScanStatus::Unsupported) cd->clrText = kGrey;
+      if (!model_.rowRecord(row)) return CDRF_DODEFAULT;
+      SelectObject(cd->nmcd.hdc, model_.rowIsGroup(row) ? fontBold_ : font_);
+      cd->clrText = C(model_.cellColor(row, cd->iSubItem));
       return CDRF_NEWFONT;
     }
   }
@@ -1660,75 +1391,44 @@ LRESULT Win32Gui::onPage(HWND h, UINT m, WPARAM w, LPARAM l) {
         case LVN_GETDISPINFOW: {
           auto di = reinterpret_cast<NMLVDISPINFOW*>(l);
           int row = di->item.iItem;
-          if (!(di->item.mask & LVIF_TEXT) || row < 0 || row >= (int)rows_.size()) return 0;
-          wcsncpy_s(di->item.pszText, di->item.cchTextMax, cellText(row, di->item.iSubItem).c_str(), _TRUNCATE);
+          if (!(di->item.mask & LVIF_TEXT) || row < 0 || row >= model_.rowCount()) return 0;
+          wcsncpy_s(di->item.pszText, di->item.cchTextMax, W(model_.cellText(row, di->item.iSubItem)).c_str(),
+                    _TRUNCATE);
           return 0;
         }
         case LVN_GETINFOTIPW: {
           auto tip = reinterpret_cast<NMLVGETINFOTIPW*>(l);
-          const PluginRecord* rp = rowRecord(tip->iItem);
-          if (!rp) return 0;
-          if (rowIsGroup(tip->iItem)) {
-            // Group: one line per copy.
-            auto& g = groups_[rows_[tip->iItem].group];
-            std::string t = rp->displayName() + " (" + std::to_string(g.recs.size()) + " files)";
-            int shown = 0;
-            for (auto& c : g.recs) {
-              if (++shown > 20) {
-                t += "\n...";
-                break;
-              }
-              t += "\n" + std::string(c.arch == "x86" ? "32" : "64") + "-bit  " + narrow(statusLabel(c.status)) +
-                   "  " + fileNameOf(c.path);
-            }
-            t += "\nDouble-click to show all copies; Load picks " + fileNameOf(rp->path);
-            wcsncpy_s(tip->pszText, tip->cchTextMax, W(t).c_str(), _TRUNCATE);
-            return 0;
-          }
-          auto& rec = *rp;
-          std::string t = rec.displayName();
-          if (!rec.vendor.empty()) t += " by " + rec.vendor;
-          t += "\n" + std::string(rec.arch == "x86" ? "32-bit" : "64-bit") + ", " + narrow(statusLabel(rec.status));
-          if (!rec.detail.empty()) t += "\n" + rec.detail;
-          for (size_t i = 1; i < rec.warnings.size(); ++i) t += "\n" + rec.warnings[i];
-          if (rec.numParams) t += "\n" + std::to_string(rec.numParams) + " parameters";
-          if (rec.numPrograms > 1) t += ", " + std::to_string(rec.numPrograms) + " presets";
-          if (rec.cpuPercent > 0) {
-            char b[64];
-            snprintf(b, sizeof b, "\nCPU during test: %.1f%% of one core", rec.cpuPercent);
-            t += b;
-          }
-          t += "\n" + rec.path;
-          wcsncpy_s(tip->pszText, tip->cchTextMax, W(t).c_str(), _TRUNCATE);
+          if (!model_.rowRecord(tip->iItem)) return 0;
+          wcsncpy_s(tip->pszText, tip->cchTextMax, W(model_.tooltip(tip->iItem)).c_str(), _TRUNCATE);
           return 0;
         }
         case NM_CLICK: {
           // Clicking the arrow of a group row opens / closes it.
           auto ia = reinterpret_cast<NMITEMACTIVATE*>(l);
-          if (rowIsGroup(ia->iItem) && ia->iSubItem == 0 && ia->ptAction.x < S(28)) toggleGroup(ia->iItem);
+          if (model_.rowIsGroup(ia->iItem) && ia->iSubItem == 0 && ia->ptAction.x < S(28)) toggleGroup(ia->iItem);
           return 0;
         }
         case NM_DBLCLK: {
           int row = ListView_GetNextItem(lv_, -1, LVNI_SELECTED);
-          if (rowIsGroup(row)) toggleGroup(row);
+          if (model_.rowIsGroup(row)) toggleGroup(row);
           else loadSelected(false);
           return 0;
         }
         case LVN_KEYDOWN: {
           int row = ListView_GetNextItem(lv_, -1, LVNI_SELECTED);
           WORD vk = reinterpret_cast<NMLVKEYDOWN*>(l)->wVKey;
-          bool open = rowIsGroup(row) && expanded_.count(groups_[rows_[row].group].key);
+          bool open = model_.rowExpanded(row);
           if (vk == VK_RETURN) loadSelected(false);
-          else if (vk == VK_RIGHT && rowIsGroup(row) && !open) toggleGroup(row);
-          else if (vk == VK_LEFT && rowIsGroup(row) && open) toggleGroup(row);
+          else if (vk == VK_RIGHT && model_.rowIsGroup(row) && !open) toggleGroup(row);
+          else if (vk == VK_LEFT && model_.rowIsGroup(row) && open) toggleGroup(row);
           return 0;
         }
         case LVN_COLUMNCLICK: {
           int col = reinterpret_cast<NMLISTVIEW*>(l)->iSubItem;
-          if (col == sortColumn_) sortAscending_ = !sortAscending_;
+          if (col == model_.sortColumn) model_.sortAscending = !model_.sortAscending;
           else {
-            sortColumn_ = col;
-            sortAscending_ = true;
+            model_.sortColumn = col;
+            model_.sortAscending = true;
           }
           refreshList();
           InvalidateRect(ListView_GetHeader(lv_), nullptr, TRUE);

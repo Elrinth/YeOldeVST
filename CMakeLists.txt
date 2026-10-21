@@ -196,6 +196,7 @@ endif()
 
 add_library(yov_plugin_impl STATIC
   src/plugin/Plugin.cpp
+  src/plugin/BrowserModel.cpp
   src/plugin/Gui.cpp
   src/plugin/HostedPlugin.cpp
   src/plugin/BridgeClient.cpp
