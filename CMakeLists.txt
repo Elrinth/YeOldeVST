@@ -208,6 +208,29 @@ if(WIN32)
   target_link_libraries(yov_plugin_impl PUBLIC comctl32 gdi32 uxtheme dwmapi shlwapi)
 endif()
 
+# --- Dear ImGui GUI -----------------------------------------------------------------------------
+if(YOV_IMGUI)
+  add_library(yov_imgui STATIC
+    third_party/imgui/imgui.cpp
+    third_party/imgui/imgui_draw.cpp
+    third_party/imgui/imgui_tables.cpp
+    third_party/imgui/imgui_widgets.cpp
+    third_party/imgui/backends/imgui_impl_opengl3.cpp
+  )
+  target_include_directories(yov_imgui PUBLIC third_party/imgui third_party/imgui/backends)
+  target_sources(yov_plugin_impl PRIVATE src/plugin/imgui/ImGuiGui.cpp)
+  target_compile_definitions(yov_plugin_impl PRIVATE YOV_IMGUI)
+  target_link_libraries(yov_plugin_impl PUBLIC yov_imgui)
+  if(WIN32)
+    target_sources(yov_plugin_impl PRIVATE src/plugin/imgui/WglGuiWindow.cpp)
+    target_link_libraries(yov_plugin_impl PUBLIC opengl32)
+  elseif(NOT APPLE)
+    find_package(OpenGL REQUIRED)
+    target_sources(yov_plugin_impl PRIVATE src/plugin/imgui/X11GuiWindow.cpp)
+    target_link_libraries(yov_plugin_impl PUBLIC OpenGL::GL X11::X11)
+  endif()
+endif()
+
 foreach(fmt clap vst3)
   add_library(yov_${fmt} MODULE
     src/plugin/entry.cpp

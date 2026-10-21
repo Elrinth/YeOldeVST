@@ -186,6 +186,14 @@ static std::string jsonEscape(const std::string& s) {
   return o;
 }
 
+// The state blob that loads a VST2. YOV_TEST_SANDBOXED=1 loads it in the bridge process (as
+// "Load sandboxed" does); YOV_TEST_GENERIC=1 shows the generic editor.
+static std::string testState(const char* path) {
+  return std::string("{\"format\":\"YeOldeVST\",\"version\":1,\"path\":\"") + jsonEscape(path) + "\",\"shellId\":0" +
+         (getenv("YOV_TEST_SANDBOXED") ? ",\"sandboxed\":true" : "") +
+         (getenv("YOV_TEST_GENERIC") ? ",\"genericView\":true" : "") + "}";
+}
+
 struct Instance {
   const clap_plugin_t* p = nullptr;
   const clap_plugin_state_t* state = nullptr;
@@ -486,9 +494,7 @@ int main(int argc, char** argv) {
   printf("factory has %u plugins\n", f->get_plugin_count(f));
 
   if (mode == "render" && argc >= 5) {
-    // YOV_TEST_SANDBOXED=1: load it in the bridge process (as "Load sandboxed" does).
-    std::string state = std::string("{\"format\":\"YeOldeVST\",\"version\":1,\"path\":\"") + jsonEscape(argv[4]) +
-                        "\",\"shellId\":0" + (getenv("YOV_TEST_SANDBOXED") ? ",\"sandboxed\":true" : "") + "}";
+    std::string state = testState(argv[4]);
     Instance a = create(f, id);
     {
       // What a host that reads the list only once (right after creating us) gets.
@@ -576,11 +582,7 @@ int main(int argc, char** argv) {
       return 4;
     }
     Instance a = create(f, id);
-    if (argc >= 6 && argv[5][0]) {
-      std::string state = std::string("{\"format\":\"YeOldeVST\",\"version\":1,\"path\":\"") + jsonEscape(argv[5]) +
-                          "\",\"shellId\":0" + (getenv("YOV_TEST_GENERIC") ? ",\"genericView\":true" : "") + "}";
-      loadState(a, state);
-    }
+    if (argc >= 6 && argv[5][0]) loadState(a, testState(argv[5]));
     a.p->activate(a.p, 44100, 32, 512);
     if (!a.gui->create(a.p, CLAP_WINDOW_API_X11, false)) {
       printf("gui create failed\n");
@@ -660,11 +662,7 @@ int main(int argc, char** argv) {
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     RegisterClassW(&wc);
     Instance a = create(f, id);
-    if (argc >= 6) {
-      std::string state = std::string("{\"format\":\"YeOldeVST\",\"version\":1,\"path\":\"") + jsonEscape(argv[5]) +
-                          "\",\"shellId\":0}";
-      loadState(a, state);
-    }
+    if (argc >= 6) loadState(a, testState(argv[5]));
     a.p->activate(a.p, 44100, 32, 512);
     a.gui->create(a.p, CLAP_WINDOW_API_WIN32, false);
     uint32_t w = 0, h = 0;
