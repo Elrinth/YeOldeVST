@@ -32,8 +32,7 @@ Shared* gShared = nullptr;
 LONG WINAPI bridgeUnhandled(EXCEPTION_POINTERS* ep) {
   if (gShared) {
     SehFault f;
-    f.code = ep->ExceptionRecord->ExceptionCode;
-    f.address = ep->ExceptionRecord->ExceptionAddress;
+    sehCapture(ep, &f);
     std::string d = f.describe();
     snprintf(gShared->deathReason, sizeof gShared->deathReason, "%s", d.c_str());
     gShared->dead = 1;

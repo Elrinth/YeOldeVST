@@ -4,10 +4,15 @@ A CLAP and VST3 plugin for Windows that loads old **VST 1.x / 2.x** plugins (`.d
 **64-bit and 32-bit**, and shows them inside its own window. It lets you keep using old VST2
 instruments and effects in DAWs that only load VST3 or CLAP.
 
-It comes in two flavours, both in the same file:
+It comes in three flavours, all in the same file:
 
 - **YeOldeVST Instrument**: MIDI in, stereo out
+- **YeOldeVST Instrument (multi-out)**: MIDI in, 16 stereo outputs (for Kontakt "16out", drum
+  machines and other multi-output instruments)
 - **YeOldeVST Effect**: stereo in, MIDI in, stereo out
+
+Every flavour also has a MIDI output, which carries whatever the hosted plugin sends
+(arpeggiators, MIDI generators).
 
 ## Features
 
@@ -31,7 +36,8 @@ It comes in two flavours, both in the same file:
   into the report, for example *"showed a popup: Playtime VST is not supported in this host"*. When
   you load a plugin for real, its dialogs appear normally.
 - **32-bit plugins** run in a 32-bit helper process (a bridge). Their editor is embedded in the
-  window just like a 64-bit plugin's.
+  window just like a 64-bit plugin's. The 32-bit helper runs without DEP, as hosts of that era did,
+  because many old plugins (ATL/WTL editors, copy protection) execute code from data memory.
 - **Sandboxed mode** runs a 64-bit plugin out of process too. If it crashes, only the helper dies.
   The track goes silent, and you can press *Reload plugin* to restore it with its last state.
 - **Crash guard for in-process plugins.** Every call into the plugin is wrapped in an SEH guard. A
@@ -43,7 +49,7 @@ It comes in two flavours, both in the same file:
   - parameter automation: up to 1024 parameters, named after the plugin's own
   - full state recall, using the chunk, or parameters plus the current program
   - latency reporting
-  - MIDI, including SysEx
+  - MIDI in and out, including SysEx
   - transport and tempo
 - **Moved plugins are found again.** If a project points at a plugin that has moved, YeOldeVST
   finds it by ID and name. If the plugin is missing, its settings are kept untouched until it is
@@ -76,8 +82,9 @@ The build has these outputs in `build/Release`:
 - the `YeOldeVST.vst3` bundle
 - `YeOldeVST-Host64.exe`
 - `yov_clap_test.exe`
+- `YovTest64.dll`, a test VST2 plugin (6 outputs, echoes notes back as MIDI)
 
-`YeOldeVST-Host32.exe` is built by a nested Win32 sub-build into `build/host32/Release`.
+`YeOldeVST-Host32.exe` and `YovTest32.dll` are built by a nested Win32 sub-build into `build/host32/Release`.
 
 Dependencies are git submodules, pinned:
 
@@ -156,7 +163,7 @@ These are the main source files:
 ## Known limitations
 
 - Windows only. The plugin is 64-bit only; 32-bit VST2 plugins are hosted through the bridge.
-- Only the first two outputs of multi-output instruments reach the DAW.
-- A plugin's MIDI output is not forwarded.
+- 64-bit processes always run with DEP, so a 64-bit plugin that executes data memory can't work
+  in-process or sandboxed (none in testing did).
 - VST3 hosts show parameter names only after a plugin is loaded. They update when you load another
   plugin, because the VST3 wrapper rebuilds the parameter list.

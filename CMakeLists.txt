@@ -49,6 +49,11 @@ set_target_properties(yov_host PROPERTIES OUTPUT_NAME "YeOldeVST-Host${YOV_BITS}
 if(MSVC)
   # Many old plugins assume a big main-thread stack.
   target_link_options(yov_host PRIVATE /STACK:8388608)
+  if(YOV_BITS EQUAL 32)
+    # Old plugins (ATL/WTL window thunks, self-modifying protection code) execute code from data
+    # memory, which DEP forbids. 32-bit hosts of their era ran without DEP; so does this helper.
+    target_link_options(yov_host PRIVATE /NXCOMPAT:NO)
+  endif()
 endif()
 
 # Test VST2 plugin (MIDI echo + 6 outputs), built for both architectures.

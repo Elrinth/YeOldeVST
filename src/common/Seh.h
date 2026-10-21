@@ -17,6 +17,8 @@ namespace yov {
 struct SehFault {
   uint32_t code = 0;
   void* address = nullptr;
+  void* caller = nullptr;  // for a jump to address 0: where the bad call came from
+  int accessKind = -1;      // access violations: 0 read, 1 write, 8 execute (DEP)
   std::string describe() const;
 };
 
@@ -31,5 +33,7 @@ bool sehGuard(F&& f, SehFault* fault) {
 }
 
 const char* exceptionName(uint32_t code);
+// Fills fault from an exception record/context (shared by the guard and unhandled filters).
+void sehCapture(void* exceptionPointers, SehFault* fault);
 
 }  // namespace yov

@@ -53,8 +53,7 @@ bool skipped(const char* s) {
 // Last line of defence: something faulted outside our guards (a plugin thread, a destructor).
 LONG WINAPI unhandledFilter(EXCEPTION_POINTERS* ep) {
   SehFault f;
-  f.code = ep->ExceptionRecord->ExceptionCode;
-  f.address = ep->ExceptionRecord->ExceptionAddress;
+  sehCapture(ep, &f);
   emit("fault", std::string(gStage) + "\t" + f.describe());
   TerminateProcess(GetCurrentProcess(), f.code);
   return EXCEPTION_EXECUTE_HANDLER;

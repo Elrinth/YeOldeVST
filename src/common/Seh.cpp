@@ -37,10 +37,9 @@ const char* exceptionName(uint32_t code) {
   }
 }
 
-std::string SehFault::describe() const {
-  char buf[512];
+static std::string where(void* address) {
   char mod[MAX_PATH] = "?";
-  uintptr_t offset = 0;
+  uintptr_t offset = (uintptr_t)address;
   HMODULE h = nullptr;
   if (address && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                                     (LPCSTR)address, &h)) {
@@ -51,8 +50,42 @@ std::string SehFault::describe() const {
     }
     offset = (uintptr_t)address - (uintptr_t)h;
   }
-  snprintf(buf, sizeof buf, "%s (0x%08X) in %s+0x%llX", exceptionName(code), code, mod, (unsigned long long)offset);
+  char buf[MAX_PATH + 32];
+  snprintf(buf, sizeof buf, "%s+0x%llX", mod, (unsigned long long)offset);
   return buf;
+}
+
+std::string SehFault::describe() const {
+  char buf[768];
+  if (address == nullptr && caller) {
+    snprintf(buf, sizeof buf, "%s (0x%08X): call through a null function pointer from %s", exceptionName(code), code,
+             where(caller).c_str());
+  } else if (accessKind == 8) {
+    snprintf(buf, sizeof buf, "%s (0x%08X): executed data memory at %s (blocked by DEP)", exceptionName(code), code,
+             where(address).c_str());
+  } else {
+    snprintf(buf, sizeof buf, "%s (0x%08X) in %s", exceptionName(code), code, where(address).c_str());
+  }
+  return buf;
+}
+
+void sehCapture(void* exceptionPointers, SehFault* fault) {
+  auto ep = static_cast<EXCEPTION_POINTERS*>(exceptionPointers);
+  fault->code = ep->ExceptionRecord->ExceptionCode;
+  fault->address = ep->ExceptionRecord->ExceptionAddress;
+  fault->caller = nullptr;
+  fault->accessKind = -1;
+  if (fault->code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 1)
+    fault->accessKind = (int)ep->ExceptionRecord->ExceptionInformation[0];
+  if (fault->address == nullptr) {
+    // A call to address 0 faults before the callee runs: the return address is on top of the stack.
+#if defined(_M_IX86)
+    void** sp = (void**)ep->ContextRecord->Esp;
+#else
+    void** sp = (void**)ep->ContextRecord->Rsp;
+#endif
+    if (sp && !IsBadReadPtr(sp, sizeof(void*))) fault->caller = (uint8_t*)*sp - 1;
+  }
 }
 
 static int filter(EXCEPTION_POINTERS* ep, SehFault* fault) {
@@ -61,10 +94,7 @@ static int filter(EXCEPTION_POINTERS* ep, SehFault* fault) {
   if (code == 0x40010006 /*DBG_PRINTEXCEPTION_C*/ || code == 0x4001000A /*DBG_PRINTEXCEPTION_WIDE_C*/ ||
       code == 0x406D1388 /*MS_VC_EXCEPTION thread name*/)
     return EXCEPTION_CONTINUE_EXECUTION;
-  if (fault) {
-    fault->code = code;
-    fault->address = ep->ExceptionRecord->ExceptionAddress;
-  }
+  if (fault) sehCapture(ep, fault);
   return EXCEPTION_EXECUTE_HANDLER;
 }
 
