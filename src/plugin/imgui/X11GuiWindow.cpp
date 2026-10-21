@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 
 namespace yov {
@@ -269,10 +270,23 @@ bool X11GuiWindow::pollEvents() {
   if (!dpy_) return false;
   ImGuiIO& io = ImGui::GetIO();
   bool any = false;
+  static const bool debug = [] {
+    std::string v;
+    return getEnv("YEOLDEVST_GUI_DEBUG", v);
+  }();
   while (XPending(dpy_)) {
     XEvent ev;
     XNextEvent(dpy_, &ev);
-    if (XFilterEvent(&ev, None)) continue;
+    if (debug) fprintf(stderr, "x11 event %d window 0x%lx (ours 0x%lx)\n", ev.type, ev.xany.window, win_);
+    if (XFilterEvent(&ev, None)) {
+      if (debug) fprintf(stderr, "  filtered by the input method\n");
+      continue;
+    }
+    if (ev.type == MappingNotify) {
+      // The keyboard layout changed (or a tool remapped a spare key code to type with).
+      XRefreshKeyboardMapping(&ev.xmapping);
+      continue;
+    }
     if (ev.xany.window != win_ && ev.type != SelectionRequest && ev.type != SelectionNotify &&
         ev.type != SelectionClear)
       continue;
@@ -334,6 +348,7 @@ bool X11GuiWindow::pollEvents() {
           } else {
             n = XLookupString(&ev.xkey, buf, sizeof buf - 1, &sym, nullptr);
           }
+          if (debug) fprintf(stderr, "  key: sym 0x%lx -> %d bytes (ic %p)\n", (unsigned long)sym, n, (void*)xic_);
           if (n > 0) {
             buf[n] = 0;
             if ((unsigned char)buf[0] >= 0x20 && buf[0] != 0x7F) io.AddInputCharactersUTF8(buf);
@@ -343,15 +358,21 @@ bool X11GuiWindow::pollEvents() {
         break;
       }
       case FocusIn:
-        io.AddFocusEvent(true);
-        if (xic_) XSetICFocus(xic_);
+      case FocusOut: {
+        // Pointer / inferior notifications are not real focus changes: taking the focus on a
+        // click produces a FocusOut(NotifyPointer) that must not deactivate the text field the
+        // click just activated.
+        int detail = ev.xfocus.detail;
+        if (detail == NotifyPointer || detail == NotifyInferior || detail == NotifyPointerRoot) break;
+        bool in = ev.type == FocusIn;
+        io.AddFocusEvent(in);
+        if (xic_) {
+          if (in) XSetICFocus(xic_);
+          else XUnsetICFocus(xic_);
+        }
         any = true;
         break;
-      case FocusOut:
-        io.AddFocusEvent(false);
-        if (xic_) XUnsetICFocus(xic_);
-        any = true;
-        break;
+      }
       case SelectionRequest: serveSelection(ev.xselectionrequest); break;
       case SelectionClear:
         if (ev.xselectionclear.selection == atomClipboard_) clipOwned_.clear();

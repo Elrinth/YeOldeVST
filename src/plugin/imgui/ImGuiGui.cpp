@@ -10,6 +10,7 @@
 
 #include <imgui.h>
 #include <imgui_impl_opengl3.h>
+#include <imgui_internal.h>  // ClearActiveID
 
 #include <algorithm>
 #include <cmath>
@@ -166,7 +167,6 @@ class ImGuiGui final : public Gui {
               bool enabled = true, const char* tip = nullptr);
   bool toggle(const char* id, const char* label, bool& value, float x, float y, float w, float h,
               const char* tip = nullptr);
-  void text(const std::string& s, ImFont* font, float size, uint32_t color, ImVec2 pos);
 
   // Actions
   void refreshFolders();
@@ -308,7 +308,7 @@ bool ImGuiGui::setParent(const clap_window_t* window) {
 void ImGuiGui::setupStyle() {
   ImGuiStyle& s = ImGui::GetStyle();
   s = ImGuiStyle();
-  s.WindowPadding = ImVec2(0, 0);
+  s.WindowPadding = ImVec2(8, 6);  // popups, menus, tooltips (the main window uses none)
   s.WindowBorderSize = 0;
   s.ChildBorderSize = 0;
   s.PopupBorderSize = 1;
@@ -598,10 +598,12 @@ void ImGuiGui::renderFrame() {
 
   ImGui::SetNextWindowPos(ImVec2(0, 0));
   ImGui::SetNextWindowSize(io.DisplaySize);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
   ImGui::Begin("##yov", nullptr,
                ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
                    ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoScrollWithMouse |
                    ImGuiWindowFlags_NoBackground);
+  ImGui::PopStyleVar();
   ImGui::PushFont(font_, kFontSize);
   auto* dl = ImGui::GetWindowDrawList();
   float tb = (float)S(kToolbarH);
@@ -625,10 +627,6 @@ void ImGuiGui::renderFrame() {
 
 // ---------------------------------------------------------------------------------------------
 // Widgets
-
-void ImGuiGui::text(const std::string& s, ImFont* font, float size, uint32_t color, ImVec2 pos) {
-  ImGui::GetWindowDrawList()->AddText(font, size * scale_, pos, col(color), s.c_str());
-}
 
 bool ImGuiGui::button(const char* id, const char* label, float x, float y, float w, float h, bool primary,
                       bool enabled, const char* tip) {
@@ -875,7 +873,9 @@ void ImGuiGui::drawBrowser() {
   ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2((float)S(6), std::max(0.f, (bh - fh) / 2)));
   ImGui::SetCursorPos(ImVec2(pad, y));
   ImGui::SetNextItemWidth(w - pad * 3 - filterW);
-  if (ImGui::InputTextWithHint("##search", "Search name, vendor, file...", search_, sizeof search_)) refreshList();
+  if (ImGui::InputTextWithHint("##search", "Search name, vendor, file...", search_, sizeof search_,
+                               ImGuiInputTextFlags_EscapeClearsAll))
+    refreshList();
   ImGui::SetCursorPos(ImVec2(w - pad - filterW, y));
   ImGui::SetNextItemWidth(filterW);
   if (ImGui::BeginCombo("##filter", kFilterNames[filter_])) {
@@ -959,6 +959,7 @@ void ImGuiGui::drawPluginList(float x, float y, float w, float h) {
   const bool focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows);
   const int rows = model_.rowCount();
   float rowH = std::floor(ImGui::GetFontSize() + S(6));
+  bool openContext = false;
   ImGuiListClipper clipper;
   clipper.Begin(rows, rowH);
   if (scrollToRow_ >= 0 && scrollToRow_ < rows) clipper.IncludeItemByIndex(scrollToRow_);
@@ -997,10 +998,13 @@ void ImGuiGui::drawPluginList(float x, float y, float w, float h) {
           loadSelected(false);
         }
       }
-      if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+      // Right-click works even while the search field has the keyboard (like the Win32 list).
+      if (ImGui::IsMouseClicked(ImGuiMouseButton_Right) &&
+          ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem)) {
+        ImGui::ClearActiveID();
         selRow_ = row;
         ctxRow_ = row;
-        ImGui::OpenPopup("##ctx");
+        openContext = true;  // opened outside the row's ID scope, where BeginPopup looks for it
       }
       if (row < model_.rowCount() && ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
         ImGui::SetTooltip("%s", model_.tooltip(row).c_str());
@@ -1026,6 +1030,7 @@ void ImGuiGui::drawPluginList(float x, float y, float w, float h) {
     }
   }
   scrollToRow_ = -1;
+  if (openContext) ImGui::OpenPopup("##ctx");
 
   // Keyboard: Up / Down select, Enter loads, Right / Left open and close a group.
   if (focused && rows > 0 && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId)) {
