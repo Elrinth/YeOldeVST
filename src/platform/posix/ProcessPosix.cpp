@@ -38,14 +38,44 @@ std::string hiddenDisplay() {
   return gHiddenDisplay;
 }
 
+// A pipe whose ends are close-on-exec from the start, so a child some other DAW thread forks at
+// the same moment cannot inherit them.
+bool cloexecPipe(int fds[2]) {
+#if defined(__linux__)
+  return pipe2(fds, O_CLOEXEC) == 0;
+#else
+  if (pipe(fds) != 0) return false;
+  fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+  fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+  return true;
+#endif
+}
+
+long maxFdToClose() {
+  long maxFd = sysconf(_SC_OPEN_MAX);
+  return (maxFd < 0 || maxFd > 65536) ? 65536 : maxFd;
+}
+
+// In a freshly forked child (async-signal-safe calls only): default signal handling and an
+// empty mask whatever the DAW set up, and none of the DAW's descriptors (sockets, audio
+// devices...) apart from 0-2 and `keep`.
+void resetChild(int keep, long maxFd) {
+  sigset_t none;
+  sigemptyset(&none);
+  sigprocmask(SIG_SETMASK, &none, nullptr);
+  for (int s : {SIGPIPE, SIGCHLD, SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT, SIGINT, SIGTERM}) signal(s, SIG_DFL);
+  for (int fd = 3; fd < (int)maxFd; ++fd)
+    if (fd != keep) close(fd);
+}
+
 #if defined(__linux__)
 // Starts Xvfb and waits until it accepts connections. display: ":N", or null to let it pick a
 // free one. Returns the display number, or -1.
 int spawnXvfb(const char* exe, const char* display, bool abstractOnly, pid_t& pidOut) {
   int fds[2];
-  if (pipe(fds) != 0) return -1;
-  fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+  if (!cloexecPipe(fds)) return -1;
   const pid_t parent = getpid();
+  const long maxFd = maxFdToClose();
   pid_t pid = fork();
   if (pid < 0) {
     close(fds[0]);
@@ -55,16 +85,15 @@ int spawnXvfb(const char* exe, const char* display, bool abstractOnly, pid_t& pi
   if (pid == 0) {
     prctl(PR_SET_PDEATHSIG, SIGKILL);
     if (getppid() != parent) _exit(126);
-    if (fds[1] != 3) {
-      dup2(fds[1], 3);
-      close(fds[1]);
-    }
+    if (fds[1] != 3) dup2(fds[1], 3);  // the copy is not close-on-exec
+    else fcntl(3, F_SETFD, 0);
     int devnull = open("/dev/null", O_RDWR);
     if (devnull >= 0) {
       dup2(devnull, 0);
       dup2(devnull, 1);
       dup2(devnull, 2);
     }
+    resetChild(3, maxFd);
     // -displayfd: Xvfb writes the display number to fd 3 once it accepts connections.
     const char* args[16];
     int n = 0;
@@ -205,21 +234,20 @@ bool ChildProcess::start(const std::string& exe, const std::vector<std::string>&
   std::vector<char*> envp;
   for (auto& s : envStore) envp.push_back(s.data());
   envp.push_back(nullptr);
-  long maxFd = sysconf(_SC_OPEN_MAX);
-  if (maxFd < 0 || maxFd > 65536) maxFd = 65536;
+  const long maxFd = maxFdToClose();
 
   int outPipe[2] = {-1, -1};
-  if (opt.captureOutput && pipe(outPipe) != 0) {
+  if (opt.captureOutput && !cloexecPipe(outPipe)) {
     error = "pipe failed";
     return false;
   }
-  int errPipe[2] = {-1, -1};  // reports a failed exec back to us
-  if (pipe(errPipe) != 0) {
+  int errPipe[2] = {-1, -1};  // reports a failed exec back to us (closes on exec)
+  if (!cloexecPipe(errPipe)) {
     error = "pipe failed";
+    for (int fd : outPipe)
+      if (fd >= 0) close(fd);
     return false;
   }
-  fcntl(errPipe[1], F_SETFD, FD_CLOEXEC);
-  if (outPipe[0] >= 0) fcntl(outPipe[0], F_SETFD, FD_CLOEXEC);
   const bool dieWithParent = opt.group != SpawnOptions::Group::None;
   const pid_t parent = getpid();
 
@@ -245,17 +273,11 @@ bool ChildProcess::start(const std::string& exe, const std::vector<std::string>&
       dup2(outPipe[1], 1);
       dup2(outPipe[1], 2);
     }
-    // Default signal handling and an empty mask, whatever the DAW set up.
-    sigset_t none;
-    sigemptyset(&none);
-    sigprocmask(SIG_SETMASK, &none, nullptr);
-    for (int s : {SIGPIPE, SIGCHLD, SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT, SIGINT, SIGTERM}) signal(s, SIG_DFL);
+    for (int fd = 0; fd < 3; ++fd) fcntl(fd, F_SETFD, 0);  // in case a pipe end landed on 0-2
     if (!cwd.empty() && chdir(cwd.c_str()) != 0) {
       // keep going in the inherited directory
     }
-    // Inherit nothing but stdin/out/err (the DAW's sockets, audio devices...).
-    for (int fd = 3; fd < (int)maxFd; ++fd)
-      if (fd != errPipe[1]) close(fd);
+    resetChild(errPipe[1], maxFd);
     execve(argv[0], argv.data(), envp.data());
     int e = errno;
     ssize_t w = write(errPipe[1], &e, sizeof e);
@@ -334,6 +356,8 @@ bool ChildProcess::wait(uint32_t ms) {
 }
 
 void ChildProcess::kill(uint32_t) {
+  // Under the lock: an unreaped child keeps its pid, so the signal cannot hit a recycled one.
+  std::lock_guard<std::mutex> lk(d_->m);
   if (d_->pid > 0 && !d_->ended) ::kill(d_->pid, SIGKILL);
 }
 

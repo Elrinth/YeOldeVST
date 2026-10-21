@@ -211,7 +211,7 @@ bool readFileHead(const std::string& path, size_t maxBytes, std::string& out) {
   return true;
 }
 
-bool writeFileAtomic(const std::string& path, std::string_view data) {
+bool writeFileAtomic(const std::string& path, std::string_view data, bool) {
   auto tmp = path + ".tmp" + std::to_string(GetCurrentProcessId());
   HANDLE h = CreateFileW(widen(tmp).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
   if (h == INVALID_HANDLE_VALUE) return false;

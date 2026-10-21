@@ -1534,6 +1534,6 @@ void ImGuiGui::doLoad(const PluginRecord& r, bool sandboxed) {
 
 std::unique_ptr<Gui> makeImGuiGui(Plugin& plugin) { return std::make_unique<ImGuiGui>(plugin); }
 
-void imguiGuiShutdown() {}
+void imguiGuiShutdown() { guiWindowShutdown(); }
 
 }  // namespace yov

@@ -7,6 +7,7 @@
 #include "plugin/imgui/GuiWindow.h"
 
 #include "common/Util.h"
+#include "platform/Process.h"
 #include "plugin/Plugin.h"
 
 #include <imgui.h>
@@ -22,10 +23,13 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cfloat>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <vector>
 
 namespace yov {
 
@@ -66,12 +70,39 @@ ImGuiKey mapKey(KeySym k) {
   }
 }
 
-// Our own X error handler while we create windows, so a vanished parent does not end the host
-// (Xlib's default handler exits the process).
-bool gXError = false;
-int trapError(Display*, XErrorEvent*) {
-  gXError = true;
-  return 0;
+// X errors on our own connections (a parent window the host destroyed first, ...) are ours to
+// ignore; Xlib's default handler would exit the host. Errors on every other connection go to the
+// handler that was installed before ours. The handler is process-wide, so it is installed once
+// and only put back when the plugin binary is unloaded.
+std::mutex gErrM;
+std::vector<Display*> gOurDisplays;
+XErrorHandler gPrevHandler = nullptr;
+bool gHandlerInstalled = false;
+std::atomic<bool> gXError{false};
+
+int onXError(Display* d, XErrorEvent* e) {
+  {
+    std::lock_guard<std::mutex> lk(gErrM);
+    if (std::find(gOurDisplays.begin(), gOurDisplays.end(), d) != gOurDisplays.end()) {
+      gXError = true;
+      return 0;
+    }
+  }
+  return gPrevHandler ? gPrevHandler(d, e) : 0;
+}
+
+void adoptDisplay(Display* d) {
+  std::lock_guard<std::mutex> lk(gErrM);
+  gOurDisplays.push_back(d);
+  if (!gHandlerInstalled) {
+    gHandlerInstalled = true;
+    gPrevHandler = XSetErrorHandler(onXError);
+  }
+}
+
+void releaseDisplay(Display* d) {
+  std::lock_guard<std::mutex> lk(gErrM);
+  gOurDisplays.erase(std::remove(gOurDisplays.begin(), gOurDisplays.end(), d), gOurDisplays.end());
 }
 
 class X11GuiWindow final : public GuiWindow {
@@ -121,6 +152,7 @@ class X11GuiWindow final : public GuiWindow {
   Cursor cursors_[ImGuiMouseCursor_COUNT] = {};
   int lastCursor_ = -100;
   bool swapIntervalSet_ = false;
+  bool gone_ = false;  // the host destroyed our window (with its own) before destroying us
   bool visible_ = true;
   bool editorMapped_ = false;
   int editorX_ = 0, editorY_ = 0, editorW_ = 0, editorH_ = 0;
@@ -143,11 +175,10 @@ X11GuiWindow::~X11GuiWindow() {
   if (xim_) XCloseIM(xim_);
   for (Cursor c : cursors_)
     if (c) XFreeCursor(dpy_, c);
-  auto old = XSetErrorHandler(trapError);
-  if (win_) XDestroyWindow(dpy_, win_);
+  if (win_ && !gone_) XDestroyWindow(dpy_, win_);
   if (cmap_) XFreeColormap(dpy_, cmap_);
   XSync(dpy_, False);
-  XSetErrorHandler(old);
+  releaseDisplay(dpy_);
   XCloseDisplay(dpy_);
 }
 
@@ -164,6 +195,7 @@ bool X11GuiWindow::attach(const clap_window_t* parent, int w, int h) {
     logLine("gui: cannot open the X display");
     return false;
   }
+  adoptDisplay(dpy_);
   parent_ = (Window)parent->x11;
   int screen = DefaultScreen(dpy_);
   int attrs[] = {GLX_RGBA, GLX_DOUBLEBUFFER, GLX_RED_SIZE, 8, GLX_GREEN_SIZE, 8, GLX_BLUE_SIZE, 8, None};
@@ -179,8 +211,8 @@ bool X11GuiWindow::attach(const clap_window_t* parent, int w, int h) {
   swa.background_pixel = 0x1C1D21;
   swa.event_mask = ExposureMask | StructureNotifyMask | KeyPressMask | KeyReleaseMask | ButtonPressMask |
                    ButtonReleaseMask | PointerMotionMask | EnterWindowMask | LeaveWindowMask | FocusChangeMask;
+  XSync(dpy_, False);
   gXError = false;
-  auto old = XSetErrorHandler(trapError);
   win_ = XCreateWindow(dpy_, parent_, 0, 0, (unsigned)std::max(w, 1), (unsigned)std::max(h, 1), 0, vi->depth,
                        InputOutput, vi->visual, CWColormap | CWBorderPixel | CWBackPixel | CWEventMask, &swa);
   XSetWindowAttributes ea{};
@@ -190,7 +222,6 @@ bool X11GuiWindow::attach(const clap_window_t* parent, int w, int h) {
                           CWBackPixel | CWEventMask, &ea);
   XMapWindow(dpy_, win_);
   XSync(dpy_, False);
-  XSetErrorHandler(old);
   if (gXError) {
     logLine("gui: cannot create the window in the host's window");
     XFree(vi);
@@ -243,13 +274,13 @@ bool X11GuiWindow::attach(const clap_window_t* parent, int w, int h) {
 }
 
 void X11GuiWindow::resize(int w, int h) {
-  if (!win_) return;
+  if (!win_ || gone_) return;
   XResizeWindow(dpy_, win_, (unsigned)std::max(w, 1), (unsigned)std::max(h, 1));
   XFlush(dpy_);
 }
 
 void X11GuiWindow::setVisible(bool visible) {
-  if (!win_ || visible == visible_) return;
+  if (!win_ || gone_ || visible == visible_) return;
   visible_ = visible;
   if (visible) XMapWindow(dpy_, win_);
   else XUnmapWindow(dpy_, win_);
@@ -292,6 +323,9 @@ bool X11GuiWindow::pollEvents() {
       continue;
     switch (ev.type) {
       case Expose: any = true; break;
+      case DestroyNotify:
+        if (ev.xdestroywindow.window == win_) gone_ = true;
+        break;
       case MotionNotify:
         io.AddMousePosEvent((float)ev.xmotion.x, (float)ev.xmotion.y);
         any = true;
@@ -385,14 +419,14 @@ bool X11GuiWindow::pollEvents() {
 }
 
 void X11GuiWindow::setCursor(ImGuiMouseCursor c) {
-  if (c == lastCursor_ || !win_) return;
+  if (c == lastCursor_ || !win_ || gone_) return;
   lastCursor_ = c;
   if (c < 0 || c >= ImGuiMouseCursor_COUNT) c = ImGuiMouseCursor_Arrow;
   XDefineCursor(dpy_, win_, cursors_[c]);
 }
 
 bool X11GuiWindow::beginGl(int width, int height, uint32_t clearRgb) {
-  if (!ctx_) return false;
+  if (!ctx_ || gone_) return false;
   prevDpy_ = glXGetCurrentDisplay();
   prevCtx_ = glXGetCurrentContext();
   prevDraw_ = glXGetCurrentDrawable();
@@ -419,7 +453,7 @@ void X11GuiWindow::endGl(bool swap) {
 }
 
 void X11GuiWindow::placeEditor(int x, int y, int w, int h, bool visible) {
-  if (!editor_) return;
+  if (!editor_ || gone_) return;
   if (visible && w > 0 && h > 0) {
     if (x != editorX_ || y != editorY_ || w != editorW_ || h != editorH_) {
       XMoveResizeWindow(dpy_, editor_, x, y, (unsigned)w, (unsigned)h);
@@ -456,19 +490,18 @@ bool X11GuiWindow::editorChildSize(int& w, int& h) {
 void X11GuiWindow::revealInFileManager(const std::string& path) {
   // xdg-open shows a folder; it cannot select the file in it.
   std::string dir = dirExists(path) ? path : dirOf(path);
-  pid_t pid = fork();
-  if (pid == 0) {
-    // Double fork: xdg-open is not our child, nothing to reap later.
-    if (fork() == 0) {
-      execlp("xdg-open", "xdg-open", dir.c_str(), (char*)nullptr);
-      _exit(127);
-    }
-    _exit(0);
-  }
-  if (pid > 0) {
-    int st;
-    waitpid(pid, &st, 0);
-  }
+  const char* exe = nullptr;
+  for (const char* p : {"/usr/bin/xdg-open", "/usr/local/bin/xdg-open", "/bin/xdg-open"})
+    if (access(p, X_OK) == 0) exe = p;
+  if (!exe) return;
+  // Started like the helpers (nothing of the DAW's inherited), never waited for here; finished
+  // ones are reaped on the next call.
+  static std::vector<std::unique_ptr<ChildProcess>> launched;
+  launched.erase(std::remove_if(launched.begin(), launched.end(), [](auto& c) { return c->exited(); }),
+                 launched.end());
+  auto proc = std::make_unique<ChildProcess>();
+  std::string err;
+  if (proc->start(exe, {dir}, SpawnOptions{}, err)) launched.push_back(std::move(proc));
 }
 
 // ---- clipboard ----
@@ -539,5 +572,14 @@ const char* X11GuiWindow::getClipboard(ImGuiContext*) {
 }  // namespace
 
 std::unique_ptr<GuiWindow> GuiWindow::create(Plugin& plugin) { return std::make_unique<X11GuiWindow>(plugin); }
+
+void guiWindowShutdown() {
+  std::lock_guard<std::mutex> lk(gErrM);
+  if (!gHandlerInstalled) return;
+  gHandlerInstalled = false;
+  // Put the previous handler back, unless someone replaced ours since: then leave theirs.
+  XErrorHandler cur = XSetErrorHandler(gPrevHandler);
+  if (cur != onXError) XSetErrorHandler(cur);
+}
 
 }  // namespace yov

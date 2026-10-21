@@ -45,8 +45,7 @@ std::string extractHelper(bool is32, const char* fileName) {
       }
     }
   }
-  if (!writeFileAtomic(path, std::string_view((const char*)data, size))) return {};
-  makeExecutable(path);
+  if (!writeFileAtomic(path, std::string_view((const char*)data, size), true)) return {};
   return path;
 }
 

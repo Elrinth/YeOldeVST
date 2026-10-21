@@ -14,6 +14,9 @@ namespace yov {
 
 class Plugin;
 
+// Before the plugin binary is unloaded: undo process-wide changes (X11: the error handler).
+void guiWindowShutdown();
+
 class GuiWindow {
  public:
   virtual ~GuiWindow() = default;

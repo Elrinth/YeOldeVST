@@ -16,6 +16,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <climits>
 #include <cstdarg>
@@ -271,10 +272,13 @@ bool readFileHead(const std::string& path, size_t maxBytes, std::string& out) {
 
 bool readFile(const std::string& path, std::string& out) { return readFileHead(path, SIZE_MAX, out); }
 
-bool writeFileAtomic(const std::string& path, std::string_view data) {
-  auto tmp = path + ".tmp" + std::to_string(getpid());
-  int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+bool writeFileAtomic(const std::string& path, std::string_view data, bool executable) {
+  // A name of its own per writer: two threads saving the same file must not share a temp file.
+  static std::atomic<uint32_t> counter{0};
+  auto tmp = path + ".tmp" + std::to_string(getpid()) + "." + std::to_string(++counter);
+  int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, executable ? 0755 : 0644);
   if (fd < 0) return false;
+  if (executable) fchmod(fd, 0755);  // whatever the umask says
   size_t done = 0;
   bool ok = true;
   while (done < data.size()) {

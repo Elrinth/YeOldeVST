@@ -477,6 +477,7 @@ int Server::run(const std::string& name) {
   quit_ = true;
   audio.join();
   if (plug_ && !plug_->dead()) plug_.reset();
+  bigReply_.close();
   helper::exitNow(0);  // skip DLL teardown of whatever the plugin left
 }
 

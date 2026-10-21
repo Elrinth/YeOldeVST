@@ -269,8 +269,9 @@ bool BridgedPlugin::call(uint32_t op, int32_t index, int64_t value, double dvalu
     out->clear();
     if (c.bigSize) {
       SharedMemory m;
-      if (m.open(std::string(c.bigName, strnlen(c.bigName, sizeof c.bigName)), c.bigSize, true))
-        out->assign((uint8_t*)m.data(), (uint8_t*)m.data() + c.bigSize);
+      std::string name(c.bigName, strnlen(c.bigName, sizeof c.bigName));
+      if (m.open(name, c.bigSize, true)) out->assign((uint8_t*)m.data(), (uint8_t*)m.data() + c.bigSize);
+      SharedMemory::unlinkName(name);  // read: nothing needs the name any more
     } else {
       out->assign(c.data, c.data + std::min(c.dataSize, kCtrlDataSize));
     }
@@ -314,6 +315,7 @@ bool BridgedPlugin::start(const std::string& path, int32_t shellId, bool is32, s
     error = "the helper process did not start: " + deathReason();
     return false;
   }
+  map_.unlinkName();  // both sides have it mapped now; nothing is left behind if either dies
   std::vector<uint8_t> out;
   // Loading can show licence / registration dialogs: give the user time.
   if (!call(OpLoad, shellId, 0, 0, path.data(), path.size(), &out, 300000)) {

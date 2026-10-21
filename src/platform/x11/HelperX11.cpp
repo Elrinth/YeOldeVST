@@ -31,8 +31,8 @@ std::atomic<int> gXErrors{0};
 
 // Plugins share the process-wide Xlib error handler. The default one exits the process on any
 // error (a plugin's stray BadWindow would kill the bridge); count and carry on instead.
-int onXError(Display*, XErrorEvent*) {
-  ++gXErrors;
+int onXError(Display* d, XErrorEvent*) {
+  if (d == gDpy) ++gXErrors;  // only ours tell containerCreate() its parent is gone
   return 0;
 }
 

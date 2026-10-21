@@ -78,7 +78,8 @@ bool readFile(const std::string& path, std::string& out);
 // Reads at most maxBytes from the start of the file.
 bool readFileHead(const std::string& path, size_t maxBytes, std::string& out);
 // Writes to a temp file then renames, so readers never see a half-written file.
-bool writeFileAtomic(const std::string& path, std::string_view data);
+// executable: POSIX mode 0755 before it appears under its name (Windows: ignored).
+bool writeFileAtomic(const std::string& path, std::string_view data, bool executable = false);
 // fopen with a UTF-8 path.
 FILE* openFile(const std::string& path, const char* mode);
 

@@ -13,6 +13,7 @@
 #include <ucontext.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -31,8 +32,15 @@ struct GuardFrame {
   SehFault* fault;
   GuardFrame* prev;
 };
-thread_local GuardFrame* tlsFrame = nullptr;
-thread_local void* tlsAltStack = nullptr;
+// initial-exec: read in the signal handler, which must not trigger a lazy TLS allocation (we are
+// a dlopen'ed library; the general model may malloc on a thread's first access).
+#if defined(__GNUC__)
+#define YOV_TLS_IE __attribute__((tls_model("initial-exec")))
+#else
+#define YOV_TLS_IE
+#endif
+thread_local GuardFrame* tlsFrame YOV_TLS_IE = nullptr;
+thread_local void* tlsAltStack YOV_TLS_IE = nullptr;
 
 void capture(int sig, siginfo_t* si, void* ucv, SehFault* f) {
   f->code = (uint32_t)sig;
@@ -102,8 +110,8 @@ void chain(int sig, siginfo_t* si, void* uc) {
 
 void onSignal(int sig, siginfo_t* si, void* uc) {
   if (GuardFrame* fr = tlsFrame) {
+    tlsFrame = fr->prev;  // first: a fault inside capture() must not land in this frame again
     capture(sig, si, uc, fr->fault);
-    tlsFrame = fr->prev;
     siglongjmp(fr->jb, 1);
   }
   if (gUnhandled) {
@@ -120,18 +128,19 @@ void onSignal(int sig, siginfo_t* si, void* uc) {
 }
 
 std::mutex gInstallM;
-bool gInstalled = false;
+std::atomic<bool> gInstalled{false};
 
 void installHandlers() {
+  if (gInstalled.load(std::memory_order_acquire)) return;  // every guarded call comes here
   std::lock_guard<std::mutex> lk(gInstallM);
-  if (gInstalled) return;
-  gInstalled = true;
+  if (gInstalled.load()) return;
   struct sigaction sa;
   std::memset(&sa, 0, sizeof sa);
   sa.sa_sigaction = onSignal;
   sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
   sigemptyset(&sa.sa_mask);
   for (int s : kSignals) sigaction(s, &sa, &gPrevious[s]);
+  gInstalled.store(true, std::memory_order_release);  // only now may other threads skip the lock
 }
 
 void ensureAltStack() {

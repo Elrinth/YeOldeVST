@@ -93,6 +93,12 @@ bool SharedMemory::open(const std::string& name, size_t size, bool readOnly) {
   close();
   int fd = shm_open(name.c_str(), readOnly ? O_RDONLY : O_RDWR, 0);
   if (fd < 0) return false;
+  // Touching pages past the object's end would be a SIGBUS: refuse a size it does not have.
+  struct stat st;
+  if (fstat(fd, &st) != 0 || st.st_size < (off_t)size) {
+    ::close(fd);
+    return false;
+  }
   void* p = mmap(nullptr, size, readOnly ? PROT_READ : PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
   ::close(fd);
   if (p == MAP_FAILED) return false;
@@ -108,6 +114,14 @@ void SharedMemory::close() {
   size_ = 0;
   unlinkName_.clear();
 }
+
+void SharedMemory::unlinkName() {
+  if (unlinkName_.empty()) return;
+  shm_unlink(unlinkName_.c_str());
+  unlinkName_.clear();
+}
+
+void SharedMemory::unlinkName(const std::string& name) { shm_unlink(name.c_str()); }
 
 // ---- IpcEvent ----
 

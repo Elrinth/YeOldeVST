@@ -28,8 +28,14 @@ class SharedMemory {
 
   // The creator owns the name: on POSIX systems it is removed when the creator closes it.
   bool create(const std::string& name, size_t size);
+  // Fails if the object is smaller than size.
   bool open(const std::string& name, size_t size, bool readOnly = false);
   void close();
+  // POSIX: removes the name now; mappings stay valid and the memory goes away with the last one,
+  // so nothing is left in /dev/shm if a process dies. Windows: nothing to do (named objects
+  // disappear with their last handle anyway).
+  void unlinkName();
+  static void unlinkName(const std::string& name);
   void* data() const { return data_; }
   size_t size() const { return size_; }
 

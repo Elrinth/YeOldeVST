@@ -62,6 +62,9 @@ void SharedMemory::close() {
   size_ = 0;
 }
 
+void SharedMemory::unlinkName() {}
+void SharedMemory::unlinkName(const std::string&) {}
+
 // ---- IpcEvent ----
 
 IpcEvent::~IpcEvent() { close(); }

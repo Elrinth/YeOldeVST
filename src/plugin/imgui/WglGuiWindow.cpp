@@ -427,4 +427,6 @@ LRESULT WglGuiWindow::onMessage(HWND h, UINT m, WPARAM w, LPARAM l) {
 
 std::unique_ptr<GuiWindow> GuiWindow::create(Plugin& plugin) { return std::make_unique<WglGuiWindow>(plugin); }
 
+void guiWindowShutdown() {}
+
 }  // namespace yov
