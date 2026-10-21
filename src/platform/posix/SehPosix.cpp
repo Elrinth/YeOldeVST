@@ -119,16 +119,19 @@ void onSignal(int sig, siginfo_t* si, void* uc) {
   chain(sig, si, uc);
 }
 
+std::mutex gInstallM;
+bool gInstalled = false;
+
 void installHandlers() {
-  static std::once_flag once;
-  std::call_once(once, [] {
-    struct sigaction sa;
-    std::memset(&sa, 0, sizeof sa);
-    sa.sa_sigaction = onSignal;
-    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
-    sigemptyset(&sa.sa_mask);
-    for (int s : kSignals) sigaction(s, &sa, &gPrevious[s]);
-  });
+  std::lock_guard<std::mutex> lk(gInstallM);
+  if (gInstalled) return;
+  gInstalled = true;
+  struct sigaction sa;
+  std::memset(&sa, 0, sizeof sa);
+  sa.sa_sigaction = onSignal;
+  sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
+  sigemptyset(&sa.sa_mask);
+  for (int s : kSignals) sigaction(s, &sa, &gPrevious[s]);
 }
 
 void ensureAltStack() {
@@ -221,6 +224,18 @@ void setUnhandledFaultHandler(FaultHandler handler) {
   installHandlers();
   ensureAltStack();
   gUnhandled = handler;
+}
+
+void sehShutdown() {
+  std::lock_guard<std::mutex> lk(gInstallM);
+  if (!gInstalled) return;
+  gInstalled = false;
+  for (int s : kSignals) {
+    // Only where ours is still the active handler: the host may have installed its own since.
+    struct sigaction cur;
+    if (sigaction(s, nullptr, &cur) == 0 && (cur.sa_flags & SA_SIGINFO) && cur.sa_sigaction == onSignal)
+      sigaction(s, &gPrevious[s], nullptr);
+  }
 }
 
 }  // namespace yov

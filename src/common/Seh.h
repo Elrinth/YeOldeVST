@@ -48,4 +48,8 @@ const char* exceptionName(uint32_t code);
 using FaultHandler = void (*)(const SehFault& fault);
 void setUnhandledFaultHandler(FaultHandler handler);
 
+// Before the plugin binary is unloaded: puts back the signal handlers the guard replaced
+// (POSIX), so the host is not left with handlers pointing into unmapped code. No-op on Windows.
+void sehShutdown();
+
 }  // namespace yov

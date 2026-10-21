@@ -124,4 +124,6 @@ void setUnhandledFaultHandler(FaultHandler handler) {
   SetUnhandledExceptionFilter(unhandledFilter);
 }
 
+void sehShutdown() {}
+
 }  // namespace yov
