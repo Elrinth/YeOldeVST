@@ -87,12 +87,20 @@ static const clap_event_header_t* evGet(const clap_input_events_t* l, uint32_t i
   return &((EventList*)l->ctx)->notes[i].header;
 }
 static int gMidiOut = 0;
+static int gParamOut = 0;
 static int gMidiOutFirstKey = -1;
 static bool outPush(const clap_output_events_t*, const clap_event_header_t* h) {
   if (h->space_id == CLAP_CORE_EVENT_SPACE_ID && h->type == CLAP_EVENT_MIDI) {
     auto m = reinterpret_cast<const clap_event_midi_t*>(h);
     if (gMidiOutFirstKey < 0) gMidiOutFirstKey = m->data[1];
     ++gMidiOut;
+  }
+  if (h->space_id == CLAP_CORE_EVENT_SPACE_ID && h->type == CLAP_EVENT_PARAM_VALUE) {
+    ++gParamOut;
+    if (getenv("YOV_TEST_VERBOSE")) {
+      auto pv = reinterpret_cast<const clap_event_param_value_t*>(h);
+      printf("  plugin reported param %u = %.4f\n", pv->param_id, pv->value);
+    }
   }
   return true;
 }
@@ -388,13 +396,16 @@ int main(int, char**) {
                                return &((One*)l->ctx)->ev.header;
                              }};
       clap_output_events_t out{nullptr, outPush};
+      gParamOut = 0;
       a.params->flush(a.p, &in, &out);
+      a.params->flush(a.p, nullptr, &out);  // anything the plugin reported back
       Sleep(400);  // a bridged plugin's value cache refreshes a few times a second
       double v = -1;
       a.params->get_value(a.p, 3, &v);
       char txt[64] = {};
       a.params->value_to_text(a.p, 3, v, txt, sizeof txt);
-      printf("automated param 3 to 0.75 -> plugin reports %.3f ('%s')\n", v, txt);
+      printf("automated param 3 to 0.75 -> plugin reports %.3f ('%s'), echoed back to host: %d\n", v, txt,
+             gParamOut);
     }
     std::vector<float> wav;
     float p1 = render(a, instrument, &wav);

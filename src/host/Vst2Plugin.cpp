@@ -18,6 +18,10 @@ namespace {
 // Set while a plugin's entry point runs: callbacks then arrive before we could tag the AEffect.
 thread_local Vst2Plugin* tlsLoading = nullptr;
 thread_local int32_t tlsLoadingShellId = 0;
+// Set while the host itself changes a parameter. Some plugins report that change straight back
+// through audioMasterAutomate; passing the echo on would look like the user turned the knob in
+// the plugin's window (the DAW would record or override automation it is itself playing).
+thread_local Vst2Plugin* tlsHostSetting = nullptr;
 
 // Plugins often leave the FPU in odd states (unmasked exceptions, denormals on, x87 precision
 // changed). Save and restore around every audio call, and run them with denormals flushed.
@@ -364,7 +368,9 @@ float Vst2Plugin::getParameter(int32_t index) {
 void Vst2Plugin::setParameter(int32_t index, float value) {
   if (!fx_ || dead() || index < 0 || index >= fx_->numParams) return;
   auto fx = fx_;
+  tlsHostSetting = this;
   guarded("setParameter", [&] { callSetParameter(fx->setParameter, fx, index, value); });
+  tlsHostSetting = nullptr;
 }
 
 bool Vst2Plugin::canDo(const char* what) { return dispatch(effCanDo, 0, 0, (void*)what) > 0; }
@@ -527,7 +533,7 @@ intptr_t YOV_VSTCALL Vst2Plugin::hostCallback(AEffect* fx, int32_t opcode, int32
 intptr_t Vst2Plugin::onHostCallback(int32_t opcode, int32_t index, intptr_t value, void* ptr, float opt) {
   switch (opcode) {
     case audioMasterAutomate:
-      if (listener_) listener_->vstAutomate(index, opt);
+      if (listener_ && tlsHostSetting != this) listener_->vstAutomate(index, opt);
       return 0;
     case audioMasterIdle: return 1;
     case audioMasterWantMidi: return 1;
@@ -570,10 +576,10 @@ intptr_t Vst2Plugin::onHostCallback(int32_t opcode, int32_t index, intptr_t valu
       if (listener_) listener_->vstUpdateDisplay();
       return 1;
     case audioMasterBeginEdit:
-      if (listener_) listener_->vstBeginEdit(index);
+      if (listener_ && tlsHostSetting != this) listener_->vstBeginEdit(index);
       return 1;
     case audioMasterEndEdit:
-      if (listener_) listener_->vstEndEdit(index);
+      if (listener_ && tlsHostSetting != this) listener_->vstEndEdit(index);
       return 1;
     default: return 0;
   }

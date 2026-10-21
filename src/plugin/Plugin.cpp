@@ -14,7 +14,7 @@ using namespace vst2;
 
 namespace yov {
 
-static const char* kVersion = "1.0.0";
+static const char* kVersion = "1.1.0";
 
 Shared& Shared::get() {
   static Shared* s = [] {
@@ -483,8 +483,23 @@ void Plugin::queueOut(OutEvent e) {
   if (outQueue_.size() < 4096) outQueue_.push_back(e);
 }
 
+void Plugin::hostSetParameter(HostedPlugin* h, uint32_t index, double value) {
+  float v = (float)std::clamp(value, 0.0, 1.0);
+  if (index < kMaxParams) {
+    hostSet_[index].value.store(v, std::memory_order_relaxed);
+    hostSet_[index].ms.store((uint32_t)GetTickCount64(), std::memory_order_relaxed);
+  }
+  h->setParameter((int32_t)index, v);
+}
+
 void Plugin::vstAutomate(int32_t index, float value) {
   if (index < 0 || (uint32_t)index >= kMaxParams) return;
+  // An echo of a value the host itself just set (some plugins report it from their UI timer,
+  // after the call): passing it on would look like the user turned the knob.
+  auto& hs = hostSet_[index];
+  if (std::fabs(hs.value.load(std::memory_order_relaxed) - value) < 1e-6f &&
+      (uint32_t)GetTickCount64() - hs.ms.load(std::memory_order_relaxed) < 500)
+    return;
   queueOut({OutEvent::Value, (uint32_t)index, (double)value});
   if (hostParams_) hostParams_->request_flush(host_);
   if (gui_ && isMainThread()) gui_->onParamValue((uint32_t)index);
@@ -624,7 +639,7 @@ void Plugin::handleInputEvents(const clap_input_events_t* in, Slot* slot, uint32
       case CLAP_EVENT_PARAM_VALUE: {
         auto ev = reinterpret_cast<const clap_event_param_value_t*>(hdr);
         if (h && ev->param_id < (clap_id)h->info().numParams)
-          h->setParameter((int32_t)ev->param_id, (float)std::clamp(ev->value, 0.0, 1.0));
+          hostSetParameter(h, ev->param_id, ev->value);
         break;
       }
       case CLAP_EVENT_NOTE_ON: {
@@ -927,7 +942,7 @@ void Plugin::paramsFlush(const clap_input_events_t* in, const clap_output_events
       if (hdr->space_id == CLAP_CORE_EVENT_SPACE_ID && hdr->type == CLAP_EVENT_PARAM_VALUE && h) {
         auto ev = reinterpret_cast<const clap_event_param_value_t*>(hdr);
         if (ev->param_id < (clap_id)h->info().numParams)
-          h->setParameter((int32_t)ev->param_id, (float)std::clamp(ev->value, 0.0, 1.0));
+          hostSetParameter(h, ev->param_id, ev->value);
       }
     }
   }

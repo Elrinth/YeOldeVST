@@ -122,6 +122,13 @@ class Plugin final : public HostedPlugin::Listener {
   bool applyStateJson(const std::string& json, std::string& error);
   void installSlot(std::unique_ptr<Slot> s);  // swaps under the process lock; old one destroyed here
   void updateTime(const clap_event_transport_t* t, uint32_t frames);
+  // Sets a parameter on behalf of the host, remembering the value to recognise the plugin's echo.
+  void hostSetParameter(HostedPlugin* h, uint32_t index, double value);
+  struct HostSet {
+    std::atomic<float> value{-1.f};
+    std::atomic<uint32_t> ms{0};
+  };
+  HostSet hostSet_[kMaxParams];
 
   const clap_host_t* host_;
   const clap_host_params_t* hostParams_ = nullptr;

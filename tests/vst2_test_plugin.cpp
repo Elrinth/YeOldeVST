@@ -71,8 +71,15 @@ void YOV_VSTCALL processReplacing(AEffect* e, float**, float** outs, int32_t fra
     for (int i = 0; i < frames; ++i) outs[c][i] = t->held ? 0.1f * float(c + 1) : 0.f;
 }
 
-void YOV_VSTCALL setParameter(AEffect*, int32_t, float) {}
-float YOV_VSTCALL getParameter(AEffect*, int32_t) { return 0.f; }
+// Like some old plugins, reports every change straight back to the host (an "echo"), and keeps
+// the value so a test can read it back.
+float gParams[4] = {};
+void YOV_VSTCALL setParameter(AEffect* e, int32_t i, float v) {
+  if (i < 0 || i >= 4) return;
+  gParams[i] = v;
+  if (auto* t = self(e); t->host) t->host(e, audioMasterAutomate, i, 0, nullptr, v);
+}
+float YOV_VSTCALL getParameter(AEffect*, int32_t i) { return i >= 0 && i < 4 ? gParams[i] : 0.f; }
 
 }  // namespace
 
@@ -87,6 +94,7 @@ extern "C" __declspec(dllexport) AEffect* VSTPluginMain(HostCallback host) {
   e.processReplacing = processReplacing;
   e.numInputs = 0;
   e.numOutputs = 6;
+  e.numParams = 4;
   e.flags = effFlagsCanReplacing | effFlagsIsSynth;
   e.uniqueID = 'YOVt';
   e.version = 1;

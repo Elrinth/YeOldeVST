@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(YeOldeVST VERSION 1.0.0 LANGUAGES C CXX)
+project(YeOldeVST VERSION 1.1.0 LANGUAGES C CXX)
 
 if(NOT WIN32)
   message(FATAL_ERROR "YeOldeVST hosts Windows VST2 DLLs and is Windows-only.")
