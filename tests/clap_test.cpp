@@ -1,0 +1,385 @@
+// Minimal CLAP host used to test YeOldeVST.clap without a DAW.
+//
+//   yov_clap_test <YeOldeVST.clap> render <instrument|effect> <vst2.dll> [out.wav]
+//       loads the VST2 via a state blob, plays notes / audio, saves + restores state into a
+//       second instance and checks both produce sound.
+//   yov_clap_test <YeOldeVST.clap> gui <instrument|effect> <out.bmp> [vst2.dll] [seconds]
+//       opens the plugin GUI in a window, pumps messages, saves a screenshot.
+#include <clap/clap.h>
+
+#include <windows.h>
+
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+
+static std::atomic<bool> gCallback{false};
+static std::atomic<bool> gRestart{false};
+static uint32_t gReqW = 0, gReqH = 0;
+
+static bool hostResize(const clap_host_t*, uint32_t w, uint32_t h) {
+  gReqW = w;
+  gReqH = h;
+  return true;
+}
+static void hostResizeHints(const clap_host_t*) {}
+static bool hostReqShow(const clap_host_t*) { return true; }
+static bool hostReqHide(const clap_host_t*) { return true; }
+static void hostClosed(const clap_host_t*, bool) {}
+static const clap_host_gui_t kHostGui{hostResizeHints, hostResize, hostReqShow, hostReqHide, hostClosed};
+
+static void paramsRescan(const clap_host_t*, clap_param_rescan_flags) {}
+static void paramsClear(const clap_host_t*, clap_id, clap_param_clear_flags) {}
+static void paramsFlush(const clap_host_t*) {}
+static const clap_host_params_t kHostParams{paramsRescan, paramsClear, paramsFlush};
+
+static void stateDirty(const clap_host_t*) {}
+static const clap_host_state_t kHostState{stateDirty};
+
+static const void* hostGetExt(const clap_host_t*, const char* id) {
+  if (!strcmp(id, CLAP_EXT_GUI)) return &kHostGui;
+  if (!strcmp(id, CLAP_EXT_PARAMS)) return &kHostParams;
+  if (!strcmp(id, CLAP_EXT_STATE)) return &kHostState;
+  return nullptr;
+}
+static void hostRequestRestart(const clap_host_t*) { gRestart = true; }
+static void hostRequestProcess(const clap_host_t*) {}
+static void hostRequestCallback(const clap_host_t*) { gCallback = true; }
+
+static clap_host_t kHost{CLAP_VERSION_INIT, nullptr, "yov_clap_test", "test", "", "1.0",
+                         hostGetExt, hostRequestRestart, hostRequestProcess, hostRequestCallback};
+
+// ---- streams ----
+struct Buf {
+  std::string data;
+  size_t pos = 0;
+};
+static int64_t bufRead(const clap_istream_t* s, void* out, uint64_t n) {
+  auto b = (Buf*)s->ctx;
+  size_t k = (size_t)std::min<uint64_t>(n, b->data.size() - b->pos);
+  memcpy(out, b->data.data() + b->pos, k);
+  b->pos += k;
+  return (int64_t)k;
+}
+static int64_t bufWrite(const clap_ostream_t* s, const void* in, uint64_t n) {
+  ((Buf*)s->ctx)->data.append((const char*)in, (size_t)n);
+  return (int64_t)n;
+}
+
+// ---- events ----
+struct EventList {
+  std::vector<clap_event_note_t> notes;
+};
+static uint32_t evSize(const clap_input_events_t* l) { return (uint32_t)((EventList*)l->ctx)->notes.size(); }
+static const clap_event_header_t* evGet(const clap_input_events_t* l, uint32_t i) {
+  return &((EventList*)l->ctx)->notes[i].header;
+}
+static bool outPush(const clap_output_events_t*, const clap_event_header_t*) { return true; }
+
+static std::string jsonEscape(const std::string& s) {
+  std::string o;
+  for (char c : s) {
+    if (c == '\\' || c == '"') o += '\\';
+    o += c;
+  }
+  return o;
+}
+
+struct Instance {
+  const clap_plugin_t* p = nullptr;
+  const clap_plugin_state_t* state = nullptr;
+  const clap_plugin_params_t* params = nullptr;
+  const clap_plugin_gui_t* gui = nullptr;
+};
+
+static Instance create(const clap_plugin_factory_t* f, const char* id) {
+  Instance in;
+  in.p = f->create_plugin(f, &kHost, id);
+  if (!in.p || !in.p->init(in.p)) {
+    printf("create/init failed\n");
+    exit(2);
+  }
+  in.state = (const clap_plugin_state_t*)in.p->get_extension(in.p, CLAP_EXT_STATE);
+  in.params = (const clap_plugin_params_t*)in.p->get_extension(in.p, CLAP_EXT_PARAMS);
+  in.gui = (const clap_plugin_gui_t*)in.p->get_extension(in.p, CLAP_EXT_GUI);
+  return in;
+}
+
+static void mainThreadPump(Instance& in) {
+  if (gCallback.exchange(false)) in.p->on_main_thread(in.p);
+}
+
+static bool loadState(Instance& in, const std::string& s) {
+  Buf b{s};
+  clap_istream_t is{&b, bufRead};
+  bool ok = in.state->load(in.p, &is);
+  mainThreadPump(in);
+  return ok;
+}
+
+static std::string saveState(Instance& in) {
+  Buf b;
+  clap_ostream_t os{&b, bufWrite};
+  in.state->save(in.p, &os);
+  return b.data;
+}
+
+// Plays 2 s: notes for an instrument, a decaying saw burst for an effect. Returns peak.
+static float render(Instance& in, bool instrument, std::vector<float>* wav) {
+  const double sr = 44100;
+  const uint32_t block = 256;
+  in.p->activate(in.p, sr, 32, block);
+  in.p->start_processing(in.p);
+  std::vector<float> inL(block), inR(block), outL(block), outR(block);
+  float* inPtr[2] = {inL.data(), inR.data()};
+  float* outPtr[2] = {outL.data(), outR.data()};
+  clap_audio_buffer_t ain{inPtr, nullptr, 2, 0, 0};
+  clap_audio_buffer_t aout{outPtr, nullptr, 2, 0, 0};
+  EventList evs;
+  clap_input_events_t inEv{&evs, evSize, evGet};
+  clap_output_events_t outEv{nullptr, outPush};
+  clap_event_transport_t tr{};
+  tr.header = {sizeof tr, 0, CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_TRANSPORT, 0};
+  tr.flags = CLAP_TRANSPORT_HAS_TEMPO | CLAP_TRANSPORT_HAS_BEATS_TIMELINE | CLAP_TRANSPORT_IS_PLAYING |
+             CLAP_TRANSPORT_HAS_TIME_SIGNATURE;
+  tr.tempo = 120;
+  tr.tsig_num = 4;
+  tr.tsig_denom = 4;
+  float peak = 0;
+  int blocks = (int)(sr * 2 / block);
+  double phase = 0;
+  for (int b = 0; b < blocks; ++b) {
+    evs.notes.clear();
+    auto note = [&](uint16_t type, int16_t key) {
+      clap_event_note_t n{};
+      n.header = {sizeof n, 0, CLAP_CORE_EVENT_SPACE_ID, type, 0};
+      n.note_id = -1;
+      n.port_index = 0;
+      n.channel = 0;
+      n.key = key;
+      n.velocity = 0.8;
+      evs.notes.push_back(n);
+    };
+    if (b == 2) {
+      note(CLAP_EVENT_NOTE_ON, 57);
+      note(CLAP_EVENT_NOTE_ON, 64);
+    }
+    if (b == blocks / 2) {
+      note(CLAP_EVENT_NOTE_OFF, 57);
+      note(CLAP_EVENT_NOTE_OFF, 64);
+    }
+    for (uint32_t i = 0; i < block; ++i) {
+      int t = (b * (int)block + (int)i) % 22050;
+      float env = t < 4000 ? 1.f - t / 4000.f : 0.f;
+      phase += 220.0 / sr;
+      phase -= (int)phase;
+      inL[i] = inR[i] = (float)(phase * 2 - 1) * 0.3f * env;
+    }
+    tr.song_pos_beats = (clap_beattime)(b * block / sr * 2.0 * CLAP_BEATTIME_FACTOR);
+    clap_process_t pr{};
+    pr.steady_time = (int64_t)b * block;
+    pr.frames_count = block;
+    pr.transport = &tr;
+    pr.audio_inputs = instrument ? nullptr : &ain;
+    pr.audio_inputs_count = instrument ? 0 : 1;
+    pr.audio_outputs = &aout;
+    pr.audio_outputs_count = 1;
+    pr.in_events = &inEv;
+    pr.out_events = &outEv;
+    in.p->process(in.p, &pr);
+    for (uint32_t i = 0; i < block; ++i) {
+      if (b > 2) peak = std::max(peak, std::max(std::fabs(outL[i]), std::fabs(outR[i])));
+      if (wav) {
+        wav->push_back(outL[i]);
+        wav->push_back(outR[i]);
+      }
+    }
+    mainThreadPump(in);
+  }
+  in.p->stop_processing(in.p);
+  in.p->deactivate(in.p);
+  return peak;
+}
+
+static void writeWav(const char* path, const std::vector<float>& d) {
+  FILE* f = fopen(path, "wb");
+  if (!f) return;
+  uint32_t bytes = (uint32_t)d.size() * 4, v;
+  uint16_t s;
+  fwrite("RIFF", 1, 4, f);
+  v = 36 + bytes;
+  fwrite(&v, 4, 1, f);
+  fwrite("WAVEfmt ", 1, 8, f);
+  v = 16;
+  fwrite(&v, 4, 1, f);
+  s = 3;
+  fwrite(&s, 2, 1, f);
+  s = 2;
+  fwrite(&s, 2, 1, f);
+  v = 44100;
+  fwrite(&v, 4, 1, f);
+  v = 44100 * 8;
+  fwrite(&v, 4, 1, f);
+  s = 8;
+  fwrite(&s, 2, 1, f);
+  s = 32;
+  fwrite(&s, 2, 1, f);
+  fwrite("data", 1, 4, f);
+  fwrite(&bytes, 4, 1, f);
+  fwrite(d.data(), 4, d.size(), f);
+  fclose(f);
+}
+
+static void saveBmp(HWND w, const char* path) {
+  RECT rc;
+  GetClientRect(w, &rc);
+  HDC dc = GetDC(w);
+  HDC mem = CreateCompatibleDC(dc);
+  HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
+  SelectObject(mem, bmp);
+  PrintWindow(w, mem, PW_CLIENTONLY | PW_RENDERFULLCONTENT);
+  BITMAPINFOHEADER bi{sizeof bi, rc.right, -rc.bottom, 1, 24, BI_RGB};
+  int stride = ((rc.right * 3 + 3) & ~3);
+  std::vector<uint8_t> px((size_t)stride * rc.bottom);
+  GetDIBits(mem, bmp, 0, rc.bottom, px.data(), (BITMAPINFO*)&bi, DIB_RGB_COLORS);
+  BITMAPFILEHEADER fh{0x4D42, (DWORD)(sizeof fh + sizeof bi + px.size()), 0, 0, sizeof fh + sizeof bi};
+  bi.biHeight = -rc.bottom;
+  FILE* f = fopen(path, "wb");
+  fwrite(&fh, sizeof fh, 1, f);
+  fwrite(&bi, sizeof bi, 1, f);
+  fwrite(px.data(), 1, px.size(), f);
+  fclose(f);
+  DeleteObject(bmp);
+  DeleteDC(mem);
+  ReleaseDC(w, dc);
+}
+
+static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+  if (m == WM_CLOSE) {
+    PostQuitMessage(0);
+    return 0;
+  }
+  return DefWindowProcW(h, m, w, l);
+}
+
+int main(int argc, char** argv) {
+  if (argc < 4) {
+    printf("usage: see source\n");
+    return 1;
+  }
+  HMODULE mod = LoadLibraryA(argv[1]);
+  if (!mod) {
+    printf("cannot load %s\n", argv[1]);
+    return 2;
+  }
+  auto entry = (const clap_plugin_entry_t*)GetProcAddress(mod, "clap_entry");
+  entry->init(argv[1]);
+  auto f = (const clap_plugin_factory_t*)entry->get_factory(CLAP_PLUGIN_FACTORY_ID);
+  std::string mode = argv[2];
+  bool instrument = std::string(argv[3]) == "instrument";
+  const char* id = instrument ? "com.thefirstboss.yeoldevst.instrument" : "com.thefirstboss.yeoldevst.effect";
+  printf("factory has %u plugins\n", f->get_plugin_count(f));
+
+  if (mode == "render" && argc >= 5) {
+    std::string state = std::string("{\"format\":\"YeOldeVST\",\"version\":1,\"path\":\"") + jsonEscape(argv[4]) +
+                        "\",\"shellId\":0}";
+    Instance a = create(f, id);
+    loadState(a, state);
+    uint32_t n = a.params->count(a.p);
+    int visible = 0;
+    clap_param_info_t info;
+    std::string firstNames;
+    for (uint32_t i = 0; i < n; ++i) {
+      a.params->get_info(a.p, i, &info);
+      if (!(info.flags & CLAP_PARAM_IS_HIDDEN)) {
+        if (visible < 4) firstNames += std::string(info.name) + ", ";
+        ++visible;
+      }
+    }
+    printf("params: %u slots, %d visible (%s...)\n", n, visible, firstNames.c_str());
+    if (visible > 0) {
+      double v;
+      char txt[128];
+      a.params->get_value(a.p, 0, &v);
+      a.params->value_to_text(a.p, 0, v, txt, sizeof txt);
+      printf("param 0 = %.3f -> '%s'\n", v, txt);
+    }
+    std::vector<float> wav;
+    float p1 = render(a, instrument, &wav);
+    printf("instance A peak: %.4f\n", p1);
+    if (argc >= 6) writeWav(argv[5], wav);
+    std::string saved = saveState(a);
+    printf("state: %zu bytes: %.160s...\n", saved.size(), saved.c_str());
+    a.p->destroy(a.p);
+
+    Instance b = create(f, id);
+    loadState(b, saved);
+    float p2 = render(b, instrument, nullptr);
+    printf("instance B (restored) peak: %.4f\n", p2);
+    std::string saved2 = saveState(b);
+    printf("restored state %s original\n", saved2 == saved ? "==" : "!=");
+    b.p->destroy(b.p);
+    entry->deinit();
+    bool ok = p1 > 1e-4f && p2 > 1e-4f;
+    printf(ok ? "PASS\n" : "FAIL\n");
+    return ok ? 0 : 3;
+  }
+
+  if (mode == "gui" && argc >= 5) {
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = wndProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"yovtest";
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    RegisterClassW(&wc);
+    Instance a = create(f, id);
+    if (argc >= 6) {
+      std::string state = std::string("{\"format\":\"YeOldeVST\",\"version\":1,\"path\":\"") + jsonEscape(argv[5]) +
+                          "\",\"shellId\":0}";
+      loadState(a, state);
+    }
+    a.p->activate(a.p, 44100, 32, 512);
+    a.gui->create(a.p, CLAP_WINDOW_API_WIN32, false);
+    uint32_t w = 0, h = 0;
+    a.gui->get_size(a.p, &w, &h);
+    RECT r{0, 0, (LONG)w, (LONG)h};
+    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    HWND top = CreateWindowW(L"yovtest", L"YeOldeVST test", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 40, 40,
+                             r.right - r.left, r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
+    clap_window_t win{CLAP_WINDOW_API_WIN32};
+    win.win32 = top;
+    a.gui->set_parent(a.p, &win);
+    a.gui->show(a.p);
+    int seconds = argc >= 7 ? atoi(argv[6]) : 3;
+    DWORD end = GetTickCount() + seconds * 1000;
+    MSG msg;
+    while (GetTickCount() < end) {
+      while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_QUIT) end = 0;
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+      }
+      mainThreadPump(a);
+      if (gReqW) {
+        RECT rr{0, 0, (LONG)gReqW, (LONG)gReqH};
+        AdjustWindowRect(&rr, WS_OVERLAPPEDWINDOW, FALSE);
+        SetWindowPos(top, nullptr, 0, 0, rr.right - rr.left, rr.bottom - rr.top, SWP_NOMOVE | SWP_NOZORDER);
+        a.gui->set_size(a.p, gReqW, gReqH);
+        gReqW = gReqH = 0;
+      }
+      Sleep(10);
+    }
+    saveBmp(top, argv[4]);
+    a.gui->destroy(a.p);
+    a.p->deactivate(a.p);
+    a.p->destroy(a.p);
+    DestroyWindow(top);
+    entry->deinit();
+    printf("saved %s\n", argv[4]);
+    return 0;
+  }
+  return 1;
+}

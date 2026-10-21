@@ -38,6 +38,11 @@ class HostedPlugin {
   virtual void resume() = 0;
   virtual void suspend() = 0;
   virtual std::string paramName(int32_t index) = 0;
+  virtual std::vector<std::string> paramNames(int32_t count) {
+    std::vector<std::string> v;
+    for (int32_t i = 0; i < count; ++i) v.push_back(paramName(i));
+    return v;
+  }
   virtual std::string paramDisplay(int32_t index) = 0;  // value text incl. label
   virtual int32_t currentProgram() = 0;
   virtual void setProgram(int32_t index) = 0;

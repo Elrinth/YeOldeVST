@@ -212,7 +212,14 @@ std::vector<std::string> defaultVstFolders() {
   return out;
 }
 
-std::string clipboardText(const std::string& s) { return s; }
+// Removes windows a plugin left in the editor host after effEditClose. Only our own thread's
+// windows can be destroyed here; a bridge process cleans up its own.
+void destroyLeftovers(HWND host) {
+  std::vector<HWND> kids;
+  for (HWND c = GetWindow(host, GW_CHILD); c && kids.size() < 64; c = GetWindow(c, GW_HWNDNEXT)) kids.push_back(c);
+  for (HWND c : kids)
+    if (GetWindowThreadProcessId(c, nullptr) == GetCurrentThreadId()) DestroyWindow(c);
+}
 
 }  // namespace
 
@@ -670,16 +677,14 @@ void Gui::closeEditor() {
   editorOpen_ = false;
   if (auto h = plugin_.hosted())
     if (!h->dead()) h->editorClose();
-  // Remove anything the plugin left behind.
-  while (HWND c = GetWindow(editorHost_, GW_CHILD)) DestroyWindow(c);
+  destroyLeftovers(editorHost_);
 }
 
 void Gui::beforeUnload(HostedPlugin* p) {
   if (editorOpen_ && plugin_.hosted() == p) {
     editorOpen_ = false;
     if (p && !p->dead()) p->editorClose();
-    if (editorHost_)
-      while (HWND c = GetWindow(editorHost_, GW_CHILD)) DestroyWindow(c);
+    if (editorHost_) destroyLeftovers(editorHost_);
   }
   editorW_ = editorH_ = 0;
 }

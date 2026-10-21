@@ -41,6 +41,102 @@ struct FpuGuard {
   }
 };
 
+// ---- calling into the plugin ----
+// MSVC's 32-bit code only keeps the stack 4-byte aligned, but plugins built with GCC or Intel's
+// compiler assume 16-byte alignment at every call and crash in their SSE code otherwise (32-bit
+// Sylenth1 is one). On x86 every call into a plugin goes through a thunk that aligns the stack.
+#if defined(_M_IX86)
+__declspec(noinline) intptr_t callDispatcher(DispatcherProc f, AEffect* e, int32_t op, int32_t idx, intptr_t val,
+                                             void* aPtr, float aOpt) {
+  intptr_t r;
+  __asm {
+    mov eax, esp
+    and esp, 0xFFFFFFF0
+    sub esp, 4  // 4 + saved esp 4 + 6 args 24 = 32
+    push eax
+    push aOpt
+    push aPtr
+    push val
+    push idx
+    push op
+    push e
+    call f
+    add esp, 24
+    pop esp
+    mov r, eax
+  }
+  return r;
+}
+__declspec(noinline) void callProcess(ProcessProc f, AEffect* e, float** aIn, float** aOut, int32_t aN) {
+  __asm {
+    mov eax, esp
+    and esp, 0xFFFFFFF0
+    sub esp, 12  // 12 + 4 + 16 = 32
+    push eax
+    push aN
+    push aOut
+    push aIn
+    push e
+    call f
+    add esp, 16
+    pop esp
+  }
+}
+__declspec(noinline) void callSetParameter(SetParameterProc f, AEffect* e, int32_t idx, float v) {
+  __asm {
+    mov eax, esp
+    and esp, 0xFFFFFFF0
+    push eax  // 4 + 12 = 16
+    push v
+    push idx
+    push e
+    call f
+    add esp, 12
+    pop esp
+  }
+}
+__declspec(noinline) float callGetParameter(GetParameterProc f, AEffect* e, int32_t idx) {
+  float r;
+  __asm {
+    mov eax, esp
+    and esp, 0xFFFFFFF0
+    sub esp, 4  // 4 + 4 + 8 = 16
+    push eax
+    push idx
+    push e
+    call f
+    add esp, 8
+    pop esp
+    fstp r
+  }
+  return r;
+}
+__declspec(noinline) AEffect* callEntry(EntryProc f, HostCallback cb) {
+  AEffect* r;
+  __asm {
+    mov eax, esp
+    and esp, 0xFFFFFFF0
+    sub esp, 8  // 8 + 4 + 4 = 16
+    push eax
+    push cb
+    call f
+    add esp, 4
+    pop esp
+    mov r, eax
+  }
+  return r;
+}
+#else
+inline intptr_t callDispatcher(DispatcherProc f, AEffect* e, int32_t op, int32_t idx, intptr_t val, void* ptr,
+                               float opt) {
+  return f(e, op, idx, val, ptr, opt);
+}
+inline void callProcess(ProcessProc f, AEffect* e, float** in, float** out, int32_t n) { f(e, in, out, n); }
+inline void callSetParameter(SetParameterProc f, AEffect* e, int32_t idx, float v) { f(e, idx, v); }
+inline float callGetParameter(GetParameterProc f, AEffect* e, int32_t idx) { return f(e, idx); }
+inline AEffect* callEntry(EntryProc f, HostCallback cb) { return f(cb); }
+#endif
+
 std::string lastErrorText(DWORD err) {
   wchar_t* msg = nullptr;
   FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr,
@@ -121,6 +217,27 @@ std::unique_ptr<Vst2Plugin> Vst2Plugin::load(const std::string& path, int32_t sh
   p->time_.timeSigDenominator = 4;
   p->time_.flags = kVstTempoValid | kVstTimeSigValid | kVstPpqPosValid | kVstBarsValid;
 
+  // Many old plugins find their own files (and DLLs they load at runtime) relative to the
+  // current directory, as classic hosts set it to the plugin's folder while loading. Do the same
+  // for the duration of the load, then put the host's directory back.
+  struct CwdScope {
+    std::unique_lock<std::mutex> lk;
+    std::wstring old;
+    explicit CwdScope(const std::string& dir) : lk(cwdMutex()) {
+      wchar_t buf[4096];
+      DWORD n = GetCurrentDirectoryW(4096, buf);
+      if (n > 0 && n < 4096) old.assign(buf, n);
+      if (!dir.empty()) SetCurrentDirectoryW(widen(dir).c_str());
+    }
+    ~CwdScope() {
+      if (!old.empty()) SetCurrentDirectoryW(old.c_str());
+    }
+    static std::mutex& cwdMutex() {
+      static std::mutex m;
+      return m;
+    }
+  } cwd(dirOf(path));
+
   // Don't let a missing dependency pop up a system error box.
   UINT oldMode = SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
   HMODULE mod = nullptr;
@@ -160,7 +277,7 @@ std::unique_ptr<Vst2Plugin> Vst2Plugin::load(const std::string& path, int32_t sh
   AEffect* fx = nullptr;
   tlsLoading = p.get();
   tlsLoadingShellId = shellId;
-  ok = sehGuard([&] { fx = entry(&Vst2Plugin::hostCallback); }, &fault);
+  ok = sehGuard([&] { fx = callEntry(entry, &Vst2Plugin::hostCallback); }, &fault);
   tlsLoading = nullptr;
   tlsLoadingShellId = 0;
   if (!ok) {
@@ -227,7 +344,7 @@ intptr_t Vst2Plugin::dispatch(int32_t op, int32_t index, intptr_t value, void* p
                       : op == effProcessEvents ? "effProcessEvents"
                                               : "dispatcher";
   auto fx = fx_;
-  guarded(stage, [&] { r = fx->dispatcher(fx, op, index, value, ptr, opt); });
+  guarded(stage, [&] { r = callDispatcher(fx->dispatcher, fx, op, index, value, ptr, opt); });
   return r;
 }
 
@@ -244,14 +361,14 @@ float Vst2Plugin::getParameter(int32_t index) {
   if (!fx_ || dead() || index < 0 || index >= fx_->numParams) return 0.f;
   float v = 0.f;
   auto fx = fx_;
-  guarded("getParameter", [&] { v = fx->getParameter(fx, index); });
+  guarded("getParameter", [&] { v = callGetParameter(fx->getParameter, fx, index); });
   return v;
 }
 
 void Vst2Plugin::setParameter(int32_t index, float value) {
   if (!fx_ || dead() || index < 0 || index >= fx_->numParams) return;
   auto fx = fx_;
-  guarded("setParameter", [&] { fx->setParameter(fx, index, value); });
+  guarded("setParameter", [&] { callSetParameter(fx->setParameter, fx, index, value); });
 }
 
 bool Vst2Plugin::canDo(const char* what) { return dispatch(effCanDo, 0, 0, (void*)what) > 0; }
@@ -304,12 +421,12 @@ bool Vst2Plugin::process(float** inputs, float** outputs, int32_t frames) {
   FpuGuard fpu;
   auto fx = fx_;
   if (canReplacing()) {
-    return guarded("processReplacing", [&] { fx->processReplacing(fx, inputs, outputs, frames); });
+    return guarded("processReplacing", [&] { callProcess(fx->processReplacing, fx, inputs, outputs, frames); });
   }
   // VST 1.x: process() adds into the outputs.
   for (int32_t c = 0; c < fx->numOutputs; ++c) std::memset(outputs[c], 0, sizeof(float) * size_t(frames));
   if (!fx->process) return false;
-  return guarded("process", [&] { fx->process(fx, inputs, outputs, frames); });
+  return guarded("process", [&] { callProcess(fx->process, fx, inputs, outputs, frames); });
 }
 
 bool Vst2Plugin::processEvents(VstEvents* events) {

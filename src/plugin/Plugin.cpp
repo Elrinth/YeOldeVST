@@ -405,12 +405,10 @@ void Plugin::rebuildParamNames() {
   auto h = hosted();
   if (!h) return;
   int n = std::min<int>(h->info().numParams, (int)kMaxParams);
-  paramNames_.reserve(n);
-  for (int i = 0; i < n; ++i) {
-    auto s = h->paramName(i);
-    if (s.empty()) s = "Param " + std::to_string(i + 1);
-    paramNames_.push_back(s);
-  }
+  paramNames_ = h->paramNames(n);
+  paramNames_.resize(n);
+  for (int i = 0; i < n; ++i)
+    if (paramNames_[i].empty()) paramNames_[i] = "Param " + std::to_string(i + 1);
 }
 
 void Plugin::notifyParamsChanged(bool full) {

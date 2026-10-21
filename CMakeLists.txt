@@ -107,3 +107,7 @@ set_target_properties(yov_clap PROPERTIES OUTPUT_NAME "YeOldeVST" SUFFIX ".clap"
 target_add_vst3_wrapper(TARGET yov_vst3 OUTPUT_NAME "YeOldeVST")
 # clap-wrapper's sources are C++17 (u8string / fmt pointer formatting changed in C++20).
 set_target_properties(yov_vst3-clap-wrapper-vst3-lib PROPERTIES CXX_STANDARD 17)
+
+# --- tests ------------------------------------------------------------------------------------
+add_executable(yov_clap_test tests/clap_test.cpp)
+target_link_libraries(yov_clap_test PRIVATE clap user32 gdi32)
