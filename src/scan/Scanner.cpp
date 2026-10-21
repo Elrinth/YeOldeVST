@@ -44,6 +44,24 @@ std::string extractResource(int id, const char* fileName) {
   auto path = joinPath(dir, fileName);
   FileStamp have;
   if (fileStamp(path, have) && have.size == size) return path;
+  // New build: remove helpers left by older builds (files still running stay; Windows refuses).
+  static bool cleaned = false;
+  if (!cleaned) {
+    cleaned = true;
+    auto bin = joinPath(localAppDataDir(), "bin");
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(widen(joinPath(bin, "*")).c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+      do {
+        std::string name = narrow(fd.cFileName);
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || name == "." || name == ".." || name == tag) continue;
+        auto old = joinPath(bin, name);
+        for (const char* f : {"YeOldeVST-Host32.exe", "YeOldeVST-Host64.exe"}) DeleteFileW(widen(joinPath(old, f)).c_str());
+        RemoveDirectoryW(widen(old).c_str());
+      } while (FindNextFileW(h, &fd));
+      FindClose(h);
+    }
+  }
   if (!writeFileAtomic(path, std::string_view((const char*)data, size))) return {};
   return path;
 }

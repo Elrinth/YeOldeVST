@@ -249,6 +249,19 @@ bool Plugin::init() {
   Shared::get();
   logLine("instance created (%s) in host '%s'", instrument_ ? "instrument" : "effect",
           host_->name ? host_->name : "?");
+  // Testing aid: start new instances with a plugin already loaded, so host test tools that
+  // can't pass a state still exercise a real VST2.
+  wchar_t autoload[2048];
+  DWORD n = GetEnvironmentVariableW(L"YEOLDEVST_TEST_AUTOLOAD", autoload, 2048);
+  if (n > 0 && n < 2048) {
+    initializing_ = true;  // the host is not ready for rescan / restart requests yet
+    PluginRecord rec;
+    rec.path = narrow(autoload);
+    rec.arch = archName(readPeInfo(rec.path).arch);
+    std::string err;
+    if (!loadVst(rec, false, err)) logLine("autoload failed: %s", err.c_str());
+    initializing_ = false;
+  }
   return true;
 }
 
@@ -365,9 +378,11 @@ bool Plugin::loadVst(const PluginRecord& rec, bool sandboxed, std::string& error
   genericView_ = !hosted()->info().hasEditor;
   rebuildParamNames();
   lastGoodState_ = buildStateJson();
-  notifyParamsChanged(true);
-  if (active_) host_->request_restart(host_);  // latency may have changed
-  if (hostState_) hostState_->mark_dirty(host_);
+  if (!initializing_) {
+    notifyParamsChanged(true);
+    if (active_) host_->request_restart(host_);  // latency may have changed
+    if (hostState_) hostState_->mark_dirty(host_);
+  }
   if (gui_) gui_->onPluginChanged();
   logLine("loaded %s (%s)", rec.path.c_str(), loadedSandboxed_ ? "bridged" : "in-process");
   return true;

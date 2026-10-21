@@ -130,6 +130,7 @@ class Plugin final : public HostedPlugin::Listener {
   double sampleRate_ = 44100;
   uint32_t maxFrames_ = 1024;
   bool active_ = false;
+  bool initializing_ = false;
 
   std::mutex procLock_;  // audio thread try_locks; main thread locks to swap the slot
   std::unique_ptr<Slot> slot_;

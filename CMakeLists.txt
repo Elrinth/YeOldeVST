@@ -104,7 +104,7 @@ foreach(fmt clap vst3)
 endforeach()
 
 set_target_properties(yov_clap PROPERTIES OUTPUT_NAME "YeOldeVST" SUFFIX ".clap")
-target_add_vst3_wrapper(TARGET yov_vst3 OUTPUT_NAME "YeOldeVST")
+target_add_vst3_wrapper(TARGET yov_vst3 OUTPUT_NAME "YeOldeVST" WINDOWS_FOLDER_VST3 TRUE)
 # clap-wrapper's sources are C++17 (u8string / fmt pointer formatting changed in C++20).
 set_target_properties(yov_vst3-clap-wrapper-vst3-lib PROPERTIES CXX_STANDARD 17)
 
