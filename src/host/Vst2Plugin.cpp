@@ -202,13 +202,9 @@ std::unique_ptr<Vst2Plugin> Vst2Plugin::load(const std::string& path, int32_t sh
                                              std::string& error) {
   std::unique_ptr<Vst2Plugin> p(new Vst2Plugin());
   p->path_ = path;
-  {
-    // audioMasterGetDirectory hands out a char*: old plugins expect the ANSI code page.
-    auto w = widen(dirOf(path));
-    int n = WideCharToMultiByte(CP_ACP, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
-    p->dir_.resize(n);
-    WideCharToMultiByte(CP_ACP, 0, w.c_str(), (int)w.size(), p->dir_.data(), n, nullptr, nullptr);
-  }
+  // audioMasterGetDirectory hands out a char*: old plugins expect the ANSI code page. For
+  // folders the code page can't spell (Cyrillic on a Western system...) use the 8.3 short name.
+  p->dir_ = ansiPath(dirOf(path));
   p->shellId_ = shellId;
   p->listener_ = listener;
   p->time_.sampleRate = p->sampleRate_;

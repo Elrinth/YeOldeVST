@@ -8,6 +8,8 @@
 #include <clap/clap.h>
 
 #include <windows.h>
+#include <commctrl.h>
+#include <shellapi.h>
 
 #include <atomic>
 #include <cmath>
@@ -15,6 +17,13 @@
 #include <cstring>
 #include <string>
 #include <vector>
+
+static std::wstring wide(const std::string& s) {
+  int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+  std::wstring w(n > 0 ? n - 1 : 0, L' ');
+  MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
+  return w;
+}
 
 static std::atomic<bool> gCallback{false};
 static std::atomic<bool> gRestart{false};
@@ -235,7 +244,7 @@ static float render(Instance& in, bool instrument, std::vector<float>* wav) {
 }
 
 static void writeWav(const char* path, const std::vector<float>& d) {
-  FILE* f = fopen(path, "wb");
+  FILE* f = _wfopen(wide(path).c_str(), L"wb");
   if (!f) return;
   uint32_t bytes = (uint32_t)d.size() * 4, v;
   uint16_t s;
@@ -277,7 +286,7 @@ static void saveBmp(HWND w, const char* path) {
   GetDIBits(mem, bmp, 0, rc.bottom, px.data(), (BITMAPINFO*)&bi, DIB_RGB_COLORS);
   BITMAPFILEHEADER fh{0x4D42, (DWORD)(sizeof fh + sizeof bi + px.size()), 0, 0, sizeof fh + sizeof bi};
   bi.biHeight = -rc.bottom;
-  FILE* f = fopen(path, "wb");
+  FILE* f = _wfopen(wide(path).c_str(), L"wb");
   fwrite(&fh, sizeof fh, 1, f);
   fwrite(&bi, sizeof bi, 1, f);
   fwrite(px.data(), 1, px.size(), f);
@@ -295,12 +304,25 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
   return DefWindowProcW(h, m, w, l);
 }
 
-int main(int argc, char** argv) {
+int main(int, char**) {
+  // Arguments as UTF-8 (plugin paths may be Cyrillic etc.).
+  int argc = 0;
+  wchar_t** wargv = CommandLineToArgvW(GetCommandLineW(), &argc);
+  static std::vector<std::string> utf8Args;
+  static std::vector<char*> argvVec;
+  for (int i = 0; i < argc; ++i) {
+    int n = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, nullptr, 0, nullptr, nullptr);
+    std::string s(n > 0 ? n - 1 : 0, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, s.data(), n, nullptr, nullptr);
+    utf8Args.push_back(s);
+  }
+  for (auto& s : utf8Args) argvVec.push_back(s.data());
+  char** argv = argvVec.data();
   if (argc < 4) {
     printf("usage: see source\n");
     return 1;
   }
-  HMODULE mod = LoadLibraryA(argv[1]);
+  HMODULE mod = LoadLibraryW(wide(argv[1]).c_str());
   if (!mod) {
     printf("cannot load %s\n", argv[1]);
     return 2;
@@ -404,6 +426,49 @@ int main(int argc, char** argv) {
         gReqW = gReqH = 0;
       }
       Sleep(10);
+    }
+    if (getenv("YOV_TEST_EXPAND_FIRST")) {
+      // Select the first group row (it starts with the expand arrow) and press Right.
+      HWND lv = FindWindowExW(FindWindowExW(FindWindowExW(top, nullptr, nullptr, nullptr), nullptr, nullptr, nullptr),
+                              nullptr, L"SysListView32", nullptr);
+      if (!lv) {
+        // Search the whole tree.
+        struct Find {
+          static BOOL CALLBACK cb(HWND h, LPARAM p) {
+            wchar_t c[64];
+            GetClassNameW(h, c, 64);
+            if (!wcscmp(c, L"SysListView32")) {
+              *(HWND*)p = h;
+              return FALSE;
+            }
+            return TRUE;
+          }
+        };
+        EnumChildWindows(top, Find::cb, (LPARAM)&lv);
+      }
+      int count = lv ? (int)SendMessageW(lv, LVM_GETITEMCOUNT, 0, 0) : 0;
+      for (int i = 0; i < count; ++i) {
+        wchar_t text[256] = {};
+        LVITEMW it{};
+        it.iSubItem = 0;
+        it.pszText = text;
+        it.cchTextMax = 256;
+        SendMessageW(lv, LVM_GETITEMTEXTW, i, (LPARAM)&it);
+        if (text[0] == 0x25B8) {
+          LVITEMW st{};
+          st.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
+          st.state = LVIS_SELECTED | LVIS_FOCUSED;
+          SendMessageW(lv, LVM_SETITEMSTATE, i, (LPARAM)&st);
+          SetFocus(lv);
+          SendMessageW(lv, WM_KEYDOWN, VK_RIGHT, 0);
+          break;
+        }
+      }
+      DWORD until = GetTickCount() + 500;
+      while (GetTickCount() < until) {
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+        Sleep(10);
+      }
     }
     saveBmp(top, argv[4]);
     a.gui->destroy(a.p);

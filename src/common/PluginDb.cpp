@@ -24,7 +24,7 @@ std::string PluginRecord::displayName() const {
   return dot == std::string::npos ? f : f.substr(0, dot);
 }
 
-std::string PluginRecord::key() const { return toLowerAscii(path) + "|" + std::to_string(shellId); }
+std::string PluginRecord::key() const { return foldCase(path) + "|" + std::to_string(shellId); }
 
 Json PluginRecord::toJson() const {
   Json j = Json::object();
@@ -41,6 +41,7 @@ Json PluginRecord::toJson() const {
     for (auto& s : warnings) w.push(s);
     j["warnings"] = std::move(w);
   }
+  if (!editor.empty()) j["editor"] = editor;
   j["name"] = name;
   j["vendor"] = vendor;
   j["product"] = product;
@@ -73,6 +74,11 @@ PluginRecord PluginRecord::fromJson(const Json& j) {
   r.detail = j.get("detail").asString();
   r.stage = j.get("stage").asString();
   for (auto& w : j.get("warnings").elements()) r.warnings.push_back(w.asString());
+  r.editor = j.get("editor").asString();
+  if (!j.has("editor") && (r.stage == "editor" || r.stage == "editor-close")) {
+    // Scanned before the editor result was recorded separately: the stage says it.
+    r.editor = r.status == ScanStatus::Timeout ? "hangs" : "crashed";
+  }
   r.name = j.get("name").asString();
   r.vendor = j.get("vendor").asString();
   r.product = j.get("product").asString();
@@ -187,14 +193,23 @@ std::vector<PluginRecord> PluginDb::all() const {
 }
 
 bool PluginDb::find(const std::string& path, int32_t shellId, PluginRecord& out) const {
-  auto lp = toLowerAscii(path);
+  auto lp = foldCase(path);
   std::lock_guard<std::mutex> lk(m_);
   for (auto& r : recs_)
-    if (r.shellId == shellId && toLowerAscii(r.path) == lp) {
+    if (r.shellId == shellId && foldCase(r.path) == lp) {
       out = r;
       return true;
     }
   return false;
+}
+
+std::vector<PluginRecord> PluginDb::forPath(const std::string& path) const {
+  auto lp = foldCase(path);
+  std::vector<PluginRecord> out;
+  std::lock_guard<std::mutex> lk(m_);
+  for (auto& r : recs_)
+    if (foldCase(r.path) == lp) out.push_back(r);
+  return out;
 }
 
 bool PluginDb::findMoved(int32_t uniqueId, const std::string& name, PluginRecord& out) const {
@@ -219,17 +234,17 @@ void PluginDb::upsert(const PluginRecord& rec) {
 }
 
 void PluginDb::removeShellChildren(const std::string& path) {
-  auto lp = toLowerAscii(path);
+  auto lp = foldCase(path);
   std::lock_guard<std::mutex> lk(m_);
   recs_.erase(std::remove_if(recs_.begin(), recs_.end(),
-                             [&](const PluginRecord& r) { return r.shellId != 0 && toLowerAscii(r.path) == lp; }),
+                             [&](const PluginRecord& r) { return r.shellId != 0 && foldCase(r.path) == lp; }),
               recs_.end());
 }
 
 void PluginDb::prune(const std::vector<std::string>& folders) {
   std::vector<std::string> lf;
   for (auto& f : folders) {
-    auto l = toLowerAscii(f);
+    auto l = foldCase(f);
     if (!l.empty() && l.back() != '\\' && l.back() != '/') l += '\\';
     for (auto& c : l)
       if (c == '/') c = '\\';
@@ -238,7 +253,7 @@ void PluginDb::prune(const std::vector<std::string>& folders) {
   std::lock_guard<std::mutex> lk(m_);
   recs_.erase(std::remove_if(recs_.begin(), recs_.end(),
                              [&](const PluginRecord& r) {
-                               auto lp = toLowerAscii(r.path);
+                               auto lp = foldCase(r.path);
                                for (auto& c : lp)
                                  if (c == '/') c = '\\';
                                bool inside = false;

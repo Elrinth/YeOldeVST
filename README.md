@@ -17,7 +17,16 @@ Every flavour also has a MIDI output, which carries whatever the hosted plugin s
 ## Features
 
 - **Plugin browser.** Add your VST2 folders, scan them, then search and filter the results
-  (working, problems, instruments, effects, 32-bit). Double-click a plugin to load it.
+  (working, problems, instruments, effects, 32-bit). Copies of the same plugin (for example 25
+  skins of one synth, or its 32- and 64-bit versions) are grouped into one row that expands to
+  show each file; loading a group picks its best working copy, preferring 64-bit. Double-click a
+  plugin to load it.
+- **Editor column.** Shows whether each plugin's editor was tested and how it went. Editors that
+  passed are never tested again. Untick *Test editors* for a much faster scan; tick it later and
+  the next scan tests only the editors that haven't been tested. *Rescan failed* re-tests only the
+  plugins that crashed, hung or wouldn't load.
+- **Unicode paths.** Folders and files with Cyrillic or other non-Latin names work everywhere.
+  Old plugins that only understand the system code page are given the folder's short (8.3) name.
 - **Fail-safe scanning.** Each plugin is tested in its own throwaway helper process with a timeout,
   so a plugin that crashes or hangs never takes the DAW down. The test does the following:
   - loads the plugin

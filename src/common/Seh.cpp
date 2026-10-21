@@ -43,10 +43,11 @@ static std::string where(void* address) {
   HMODULE h = nullptr;
   if (address && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                                     (LPCSTR)address, &h)) {
-    char full[MAX_PATH];
-    if (GetModuleFileNameA(h, full, MAX_PATH)) {
-      const char* base = strrchr(full, '\\');
-      snprintf(mod, sizeof mod, "%s", base ? base + 1 : full);
+    wchar_t full[MAX_PATH];
+    if (GetModuleFileNameW(h, full, MAX_PATH)) {
+      const wchar_t* base = wcsrchr(full, L'\\');
+      // UTF-8, so Cyrillic / other non-ANSI module names survive into reports.
+      WideCharToMultiByte(CP_UTF8, 0, base ? base + 1 : full, -1, mod, sizeof mod, nullptr, nullptr);
     }
     offset = (uintptr_t)address - (uintptr_t)h;
   }

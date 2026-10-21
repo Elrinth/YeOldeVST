@@ -44,6 +44,8 @@ struct PluginRecord {
   std::string detail;  // human readable reason for the status
   std::string stage;   // probe stage that crashed / hung
   std::vector<std::string> warnings;
+  // Editor test result: "" not tested, "none" (no editor), "ok", "crashed", "hangs", "failed".
+  std::string editor;
 
   std::string name;  // effect name, or product name, or file name
   std::string vendor;
@@ -98,6 +100,7 @@ class PluginDb {
 
   std::vector<PluginRecord> all() const;
   bool find(const std::string& path, int32_t shellId, PluginRecord& out) const;
+  std::vector<PluginRecord> forPath(const std::string& path) const;  // all records of a file
   // Fallback lookup for state recall when a plugin moved: by unique id + name.
   bool findMoved(int32_t uniqueId, const std::string& name, PluginRecord& out) const;
   void upsert(const PluginRecord& r);

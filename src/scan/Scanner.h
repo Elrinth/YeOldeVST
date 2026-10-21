@@ -61,8 +61,12 @@ class Scanner {
   std::function<void(const PluginRecord&)> onResult;
 
   // Probes one file synchronously (used by start() and by the CLI).
+  // previous: what an earlier scan found in this file (editor results that passed are reused).
   static std::vector<PluginRecord> probeFile(const std::string& path, const Options& opt,
-                                             std::atomic<bool>* cancel = nullptr);
+                                             std::atomic<bool>* cancel = nullptr,
+                                             const std::vector<PluginRecord>* previous = nullptr);
+  // Runs only the editor test for an already scanned plugin; updates r. False if cancelled.
+  static bool testEditor(PluginRecord& r, const Options& opt, std::atomic<bool>* cancel = nullptr);
 
  private:
   void run(Options opt);

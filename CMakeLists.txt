@@ -120,4 +120,4 @@ set_target_properties(yov_vst3-clap-wrapper-vst3-lib PROPERTIES CXX_STANDARD 17)
 
 # --- tests ------------------------------------------------------------------------------------
 add_executable(yov_clap_test tests/clap_test.cpp)
-target_link_libraries(yov_clap_test PRIVATE clap user32 gdi32)
+target_link_libraries(yov_clap_test PRIVATE clap user32 gdi32 shell32)

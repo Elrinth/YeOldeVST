@@ -39,6 +39,39 @@ std::string toLowerAscii(std::string_view s) {
   return r;
 }
 
+std::string foldCase(std::string_view s) {
+  bool ascii = true;
+  for (unsigned char c : s)
+    if (c >= 0x80) ascii = false;
+  if (ascii) return toLowerAscii(s);
+  std::wstring w = widen(s);
+  if (w.empty()) return {};
+  std::wstring out(w.size() * 2 + 8, L'\0');
+  int n = LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, w.c_str(), (int)w.size(), out.data(), (int)out.size(),
+                        nullptr, nullptr, 0);
+  if (n <= 0) return toLowerAscii(s);
+  out.resize(n);
+  return narrow(out);
+}
+
+std::string ansiPath(const std::string& utf8Path) {
+  std::wstring w = widen(utf8Path);
+  BOOL lossy = FALSE;
+  int n = WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, w.c_str(), (int)w.size(), nullptr, 0, nullptr, &lossy);
+  if (!lossy) {
+    std::string a(n, '\0');
+    WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, w.c_str(), (int)w.size(), a.data(), n, nullptr, nullptr);
+    return a;
+  }
+  wchar_t shortBuf[MAX_PATH * 2];
+  DWORD sn = GetShortPathNameW(w.c_str(), shortBuf, MAX_PATH * 2);
+  std::wstring use = (sn > 0 && sn < MAX_PATH * 2) ? std::wstring(shortBuf, sn) : w;
+  n = WideCharToMultiByte(CP_ACP, 0, use.c_str(), (int)use.size(), nullptr, 0, nullptr, nullptr);
+  std::string a(n, '\0');
+  WideCharToMultiByte(CP_ACP, 0, use.c_str(), (int)use.size(), a.data(), n, nullptr, nullptr);
+  return a;
+}
+
 bool endsWithNoCase(std::string_view s, std::string_view suffix) {
   if (suffix.size() > s.size()) return false;
   return toLowerAscii(s.substr(s.size() - suffix.size())) == toLowerAscii(suffix);
@@ -64,6 +97,13 @@ static std::string knownFolder(REFKNOWNFOLDERID id) {
 }
 
 std::string appDataDir() {
+  wchar_t over[1024];
+  DWORD on = GetEnvironmentVariableW(L"YEOLDEVST_DATA_DIR", over, 1024);
+  if (on > 0 && on < 1024) {
+    auto d = narrow(std::wstring(over, on));
+    makeDirs(d);
+    return d;
+  }
   auto d = joinPath(knownFolder(FOLDERID_RoamingAppData), "YeOldeVST");
   makeDirs(d);
   return d;

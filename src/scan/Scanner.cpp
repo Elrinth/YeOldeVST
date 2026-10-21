@@ -114,13 +114,13 @@ std::vector<std::string> findPluginFiles(const std::vector<std::string>& folders
         auto n = narrow(name);
         if (!endsWithNoCase(n, ".dll")) continue;
         auto f8 = narrow(full);
-        if (seen.insert(toLowerAscii(f8)).second) out.push_back(f8);
+        if (seen.insert(foldCase(f8)).second) out.push_back(f8);
       }
     } while (FindNextFileW(h, &fd));
     FindClose(h);
   }
   std::sort(out.begin(), out.end(), [](const std::string& a, const std::string& b) {
-    return toLowerAscii(a) < toLowerAscii(b);
+    return foldCase(a) < foldCase(b);
   });
   return out;
 }
@@ -335,6 +335,13 @@ void classify(PluginRecord& r, const ProbeOutcome& o, std::vector<std::pair<int3
   r.scannedAt = (uint64_t)time(nullptr);
   r.stage.clear();
   r.detail.clear();
+  bool gotFlags = false, sawEditor = false;
+  for (auto& [kind, payload] : o.lines) {
+    if (kind == "info" && payload.rfind("flags\t", 0) == 0) gotFlags = true;
+    if (kind == "stage" && (payload == "editor" || payload == "editor-close")) sawEditor = true;
+  }
+  if (gotFlags && !r.hasEditor) r.editor = "none";
+  else if (sawEditor) r.editor = done ? "ok" : o.timedOut ? "hangs" : "crashed";
 
   if (!o.spawnError.empty()) {
     r.status = ScanStatus::NoHelper;
@@ -382,7 +389,8 @@ void classify(PluginRecord& r, const ProbeOutcome& o, std::vector<std::pair<int3
 // Second phase: the editor test, in a fresh process on the visible desktop. Only runs when the
 // first phase passed, so we know loading the plugin does not pop up anything.
 void runEditorPhase(PluginRecord& r, const std::string& exe, const Scanner::Options& opt, std::atomic<bool>* cancel) {
-  if (!opt.testEditors || !opt.hiddenDesktop || !r.hasEditor || !statusLoadable(r.status)) return;
+  // Editors that already passed (this run or an earlier scan of the same file) are not tested again.
+  if (!opt.testEditors || !r.hasEditor || !statusLoadable(r.status) || r.editor == "ok" || r.editor == "none") return;
   // A plugin that popped something up while loading would do it again: keep that hidden too.
   bool popups = false;
   for (auto& w : r.warnings)
@@ -392,6 +400,10 @@ void runEditorPhase(PluginRecord& r, const std::string& exe, const Scanner::Opti
   r.scanMs += o.ms;
   PluginRecord e = r;
   classify(e, o, nullptr);
+  r.editor = e.status == ScanStatus::Ok || e.status == ScanStatus::Warning ? "ok"
+             : e.status == ScanStatus::Timeout                             ? "hangs"
+             : e.status == ScanStatus::LoadFailed                          ? "failed"
+                                                                           : "crashed";
   if (e.status == ScanStatus::Ok || e.status == ScanStatus::Warning) {
     for (auto& w : e.warnings)
       if (std::find(r.warnings.begin(), r.warnings.end(), w) == r.warnings.end()) r.warnings.push_back(w);
@@ -413,7 +425,17 @@ void runEditorPhase(PluginRecord& r, const std::string& exe, const Scanner::Opti
 
 }  // namespace
 
-std::vector<PluginRecord> Scanner::probeFile(const std::string& path, const Options& opt, std::atomic<bool>* cancel) {
+bool Scanner::testEditor(PluginRecord& r, const Options& opt, std::atomic<bool>* cancel) {
+  std::string exe = helperExePath(r.arch == "x86" ? PeArch::X86 : PeArch::X64);
+  if (exe.empty()) return false;
+  Options o = opt;
+  o.testEditors = true;
+  runEditorPhase(r, exe, o, cancel);
+  return !(cancel && cancel->load());
+}
+
+std::vector<PluginRecord> Scanner::probeFile(const std::string& path, const Options& opt, std::atomic<bool>* cancel,
+                                             const std::vector<PluginRecord>* previous) {
   std::vector<PluginRecord> out;
   PluginRecord r;
   r.path = path;
@@ -450,12 +472,26 @@ std::vector<PluginRecord> Scanner::probeFile(const std::string& path, const Opti
     return out;
   }
 
-  const Phase first = !opt.testEditors ? Phase::NoEditor : opt.hiddenDesktop ? Phase::NoEditor : Phase::All;
+  // Editor results of an earlier scan of this very file are kept when the editor isn't re-tested.
+  auto previousEditor = [&](int32_t shellId) -> std::string {
+    if (!previous) return {};
+    for (auto& p : *previous)
+      if (p.shellId == shellId && p.stamp == r.stamp) return p.editor;
+    return {};
+  };
+  auto inherit = [&](PluginRecord& rec) {
+    if (!rec.editor.empty() || !rec.hasEditor || !statusLoadable(rec.status)) return;
+    std::string prev = previousEditor(rec.shellId);
+    if (prev == "ok" || !opt.testEditors) rec.editor = prev;
+  };
+  const bool editorKnownOk = previousEditor(0) == "ok";
+  const Phase first = !opt.testEditors || opt.hiddenDesktop || editorKnownOk ? Phase::NoEditor : Phase::All;
   std::vector<std::pair<int32_t, std::string>> kids;
   auto o = runHelper(exe, path, 0, opt, first, cancel);
   if (o.cancelled) return {};
   classify(r, o, &kids);
   if (r.name.empty()) r.name = r.product;
+  inherit(r);
   if (r.status != ScanStatus::Shell) runEditorPhase(r, exe, opt, cancel);
   if (cancel && cancel->load()) return {};
   out.push_back(r);
@@ -471,6 +507,7 @@ std::vector<PluginRecord> Scanner::probeFile(const std::string& path, const Opti
     if (ko.cancelled) return {};
     classify(k, ko, nullptr);
     if (k.name.empty()) k.name = kidName;
+    inherit(k);
     runEditorPhase(k, exe, opt, cancel);
     out.push_back(k);
   }
@@ -525,8 +562,13 @@ void Scanner::run(Options opt) {
   db_.reloadIfChanged();
   std::vector<std::string> files = opt.onlyFiles.empty() ? findPluginFiles(opt.folders) : opt.onlyFiles;
 
-  // Decide what needs probing.
-  std::vector<std::string> work;
+  // Decide what needs probing: a full test, or (for unchanged plugins whose editor was never
+  // tested) just the editor test.
+  struct Job {
+    std::string path;
+    bool editorOnly;
+  };
+  std::vector<Job> jobs;
   bool host32 = !helperExePath(PeArch::X86).empty();
   for (auto& f : files) {
     PluginRecord old;
@@ -536,14 +578,22 @@ void Scanner::run(Options opt) {
     bool needs = !have || opt.rescanAll || !opt.onlyFiles.empty() || !(old.stamp == st) ||
                  old.status == ScanStatus::Unknown || (old.status == ScanStatus::NoHelper && host32) ||
                  (opt.retryFailed && statusAngry(old.status));
-    if (needs) work.push_back(f);
+    if (needs) {
+      jobs.push_back({f, false});
+    } else if (opt.testEditors) {
+      for (auto& r : db_.forPath(f))
+        if (r.hasEditor && statusLoadable(r.status) && r.editor.empty()) {
+          jobs.push_back({f, true});
+          break;
+        }
+    }
   }
   {
     std::lock_guard<std::mutex> lk(m_);
-    prog_.total = (int)work.size();
-    prog_.message = work.empty() ? "Everything is up to date." : "Scanning...";
+    prog_.total = (int)jobs.size();
+    prog_.message = jobs.empty() ? "Everything is up to date." : "Scanning...";
   }
-  logLine("scan: %d files found, %d to probe", (int)files.size(), (int)work.size());
+  logLine("scan: %d files found, %d to probe", (int)files.size(), (int)jobs.size());
 
   std::atomic<size_t> next{0};
   std::mutex saveM;
@@ -552,18 +602,33 @@ void Scanner::run(Options opt) {
     for (;;) {
       if (cancel_.load()) return;
       size_t i = next.fetch_add(1);
-      if (i >= work.size()) return;
-      const std::string& f = work[i];
+      if (i >= jobs.size()) return;
+      const std::string& f = jobs[i].path;
       {
         std::lock_guard<std::mutex> lk(m_);
         prog_.current.push_back(f);
       }
-      auto recs = probeFile(f, opt, &cancel_);
-      if (!recs.empty()) {
-        db_.removeShellChildren(f);
+      auto previous = db_.forPath(f);
+      std::vector<PluginRecord> recs;
+      if (jobs[i].editorOnly) {
+        for (auto& r : previous) {
+          if (!r.hasEditor || !statusLoadable(r.status) || !r.editor.empty()) continue;
+          if (!testEditor(r, opt, &cancel_)) break;
+          recs.push_back(r);
+        }
+        if (cancel_.load()) recs.clear();
         for (auto& r : recs) {
           db_.upsert(r);
           if (onResult) onResult(r);
+        }
+      } else {
+        recs = probeFile(f, opt, &cancel_, &previous);
+        if (!recs.empty()) {
+          db_.removeShellChildren(f);
+          for (auto& r : recs) {
+            db_.upsert(r);
+            if (onResult) onResult(r);
+          }
         }
       }
       {

@@ -64,6 +64,7 @@ enum : int {
   ID_CTX_RESCAN,
   ID_CTX_EXPLORE,
   ID_CTX_COPY,
+  ID_CTX_TOGGLE,
 };
 
 constexpr UINT_PTR kTimerId = 1;
@@ -75,8 +76,8 @@ const wchar_t* kFilterNames[F_COUNT] = {L"All plugins",      L"Working",        
                                         L"Instruments",      L"Effects",           L"32-bit only",
                                         L"Not VST2 / other"};
 
-const wchar_t* kColumns[] = {L"Name", L"Vendor", L"Type", L"Bits", L"Status", L"Details", L"File"};
-const int kColWidths[] = {200, 130, 80, 50, 80, 300, 380};
+const wchar_t* kColumns[] = {L"Name", L"Vendor", L"Type", L"Bits", L"Status", L"Editor", L"Details", L"File"};
+const int kColWidths[] = {230, 130, 90, 52, 76, 74, 280, 360};
 
 std::wstring classSuffix() {
   // Unique per module: the CLAP and VST3 builds may both be loaded in one process.
@@ -186,7 +187,7 @@ std::vector<std::string> defaultVstFolders() {
   auto add = [&](const std::string& p) {
     if (p.empty() || !dirExists(p)) return;
     for (auto& o : out)
-      if (toLowerAscii(o) == toLowerAscii(p)) return;
+      if (foldCase(o) == foldCase(p)) return;
     out.push_back(p);
   };
   for (HKEY root : {HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER}) {
@@ -434,7 +435,7 @@ void Gui::createControls() {
   btnRemoveFolder_ = button(page_, L"Remove", ID_REMOVE_FOLDER);
   btnScan_ = button(page_, L"Scan", ID_SCAN);
   btnRescan_ = button(page_, L"Rescan all", ID_RESCAN);
-  btnRetry_ = button(page_, L"Retry failed", ID_RETRY);
+  btnRetry_ = button(page_, L"Rescan failed", ID_RETRY);
   btnStop_ = button(page_, L"Stop", ID_STOP);
   tglEditors_ = button(page_, L"Test editors", ID_TGL_EDITORS);
   tglHidden_ = button(page_, L"Hide plugin popups during scan", ID_TGL_HIDDEN);
@@ -491,9 +492,11 @@ void Gui::createControls() {
   addTip(btnScan_, L"Scan new and changed plugins in the folders above. Each plugin is tested in its own "
                    L"throwaway process, so a crashing plugin cannot take your DAW down.");
   addTip(btnRescan_, L"Forget all results and test every plugin again.");
-  addTip(btnRetry_, L"Test the plugins that crashed, hung or failed to load again.");
-  addTip(tglEditors_, L"Also open and close each plugin's editor window during the scan (slower, catches "
-                      L"plugins whose UI crashes).");
+  addTip(btnRetry_, L"Test again only the plugins that crashed, hung or failed to load (including ones whose "
+                    L"editor crashed). Everything else keeps its result.");
+  addTip(tglEditors_, L"Also open and close each plugin's editor window during the scan. Slower, but catches "
+                      L"plugins whose UI crashes. Editors that already passed are not tested again; with this "
+                      L"off, the Editor column shows 'not tested' for plugins never tested.");
   addTip(tglHidden_, L"Run the scan on a hidden desktop so nag screens and licence dialogs don't pop up. "
                      L"Plugins that wait for such a dialog are reported as 'Hangs'.");
   addTip(btnLoadSandboxed_, L"Run the plugin in a separate helper process. If it crashes, only that process dies: "
@@ -753,7 +756,7 @@ void Gui::addFolder() {
           std::string p = narrow(path);
           bool dup = false;
           for (auto& f : st.folders)
-            if (toLowerAscii(f) == toLowerAscii(p)) dup = true;
+            if (foldCase(f) == foldCase(p)) dup = true;
           if (!dup) {
             st.folders.push_back(p);
             st.save();
@@ -809,8 +812,17 @@ void Gui::refreshList() {
   int filter = (int)SendMessageW(cmbFilter_, CB_GETCURSEL, 0, 0);
   wchar_t sbuf[256] = {};
   GetWindowTextW(edtSearch_, sbuf, 256);
-  std::string search = toLowerAscii(trim(narrow(sbuf)));
-  rows_.clear();
+  std::string search = foldCase(trim(narrow(sbuf)));
+  // Remember the selected row so it stays selected after the rebuild (scans refresh often).
+  std::string selId;
+  {
+    int sel = ListView_GetNextItem(lv_, -1, LVNI_SELECTED);
+    if (sel >= 0 && sel < (int)rows_.size()) {
+      auto& g = groups_[rows_[sel].group];
+      selId = g.key + "#" + (rows_[sel].member < 0 ? std::string() : g.recs[rows_[sel].member].key());
+    }
+  }
+  std::vector<PluginRecord> shown;
   for (auto& r : all) {
     if (r.status == ScanStatus::Shell) continue;
     bool other = r.status == ScanStatus::NotPlugin || r.status == ScanStatus::Unsupported;
@@ -824,30 +836,161 @@ void Gui::refreshList() {
       case F_OTHER: if (!other) continue; break;
     }
     if (!search.empty()) {
-      std::string hay = toLowerAscii(r.displayName() + " " + r.vendor + " " + r.path);
+      std::string hay = foldCase(r.displayName() + " " + r.vendor + " " + r.path);
       if (hay.find(search) == std::string::npos) continue;
     }
-    rows_.push_back(r);
+    shown.push_back(r);
   }
-  auto key = [&](const PluginRecord& r) -> std::string {
+
+  // Group copies of the same plugin (same name + vendor). Files that aren't plugins stay alone.
+  groups_.clear();
+  std::map<std::string, size_t> index;
+  for (auto& r : shown) {
+    bool other = r.status == ScanStatus::NotPlugin || r.status == ScanStatus::Unsupported;
+    std::string key = other ? "file|" + foldCase(r.path) + "|" + std::to_string(r.shellId)
+                            : foldCase(r.displayName()) + "|" + foldCase(r.vendor);
+    auto it = index.find(key);
+    if (it == index.end()) {
+      index[key] = groups_.size();
+      groups_.push_back({key, {r}, 0});
+    } else {
+      groups_[it->second].recs.push_back(r);
+    }
+  }
+  // The copy "Load" uses: working beats warning beats the rest; 64-bit beats 32-bit.
+  auto rank = [](const PluginRecord& r) {
+    int s = r.status == ScanStatus::Ok ? 0 : r.status == ScanStatus::Warning ? 2 : 10 + (int)r.status;
+    return s + (r.arch == "x64" ? 0 : 1);
+  };
+  for (auto& g : groups_) {
+    std::sort(g.recs.begin(), g.recs.end(),
+              [](const PluginRecord& a, const PluginRecord& b) { return foldCase(a.path) < foldCase(b.path); });
+    for (size_t i = 1; i < g.recs.size(); ++i)
+      if (rank(g.recs[i]) < rank(g.recs[g.best])) g.best = (int)i;
+  }
+
+  auto key = [&](const Group& g) -> std::string {
+    const PluginRecord& r = g.recs[g.best];
     switch (sortColumn_) {
-      case 1: return toLowerAscii(r.vendor);
+      case 1: return foldCase(r.vendor);
       case 2: return r.isInstrument() ? "a" : "b";
       case 3: return r.arch;
       case 4: return std::to_string((int)r.status);
-      case 5: return toLowerAscii(r.detail);
-      case 6: return toLowerAscii(r.path);
-      default: return toLowerAscii(r.displayName());
+      case 5: return r.editor;
+      case 6: return foldCase(r.detail);
+      case 7: return foldCase(r.path);
+      default: return foldCase(r.displayName());
     }
   };
-  std::stable_sort(rows_.begin(), rows_.end(), [&](const PluginRecord& a, const PluginRecord& b) {
+  std::stable_sort(groups_.begin(), groups_.end(), [&](const Group& a, const Group& b) {
     auto ka = key(a), kb = key(b);
-    if (ka == kb) return toLowerAscii(a.displayName()) < toLowerAscii(b.displayName());
+    if (ka == kb) return foldCase(a.recs[a.best].displayName()) < foldCase(b.recs[b.best].displayName());
     return sortAscending_ ? ka < kb : ka > kb;
   });
+
+  rows_.clear();
+  int newSel = -1;
+  for (int g = 0; g < (int)groups_.size(); ++g) {
+    auto rowId = [&](int m) {
+      return groups_[g].key + "#" + (m < 0 ? std::string() : groups_[g].recs[m].key());
+    };
+    if (groups_[g].recs.size() == 1) {
+      if (rowId(0) == selId) newSel = (int)rows_.size();
+      rows_.push_back({g, 0});
+      continue;
+    }
+    if (rowId(-1) == selId) newSel = (int)rows_.size();
+    rows_.push_back({g, -1});
+    if (expanded_.count(groups_[g].key))
+      for (int m = 0; m < (int)groups_[g].recs.size(); ++m) {
+        if (rowId(m) == selId) newSel = (int)rows_.size();
+        rows_.push_back({g, m});
+      }
+  }
   ListView_SetItemCountEx(lv_, (int)rows_.size(), LVSICF_NOSCROLL);
+  ListView_SetItemState(lv_, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+  if (newSel >= 0) ListView_SetItemState(lv_, newSel, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
   InvalidateRect(lv_, nullptr, FALSE);
   if (page_) InvalidateRect(page_, &statusRect_, TRUE);
+}
+
+const PluginRecord* Gui::rowRecord(int row) const {
+  if (row < 0 || row >= (int)rows_.size()) return nullptr;
+  auto& g = groups_[rows_[row].group];
+  return &g.recs[rows_[row].member < 0 ? g.best : rows_[row].member];
+}
+
+bool Gui::rowIsGroup(int row) const { return row >= 0 && row < (int)rows_.size() && rows_[row].member < 0; }
+
+void Gui::toggleGroup(int row) {
+  if (!rowIsGroup(row)) return;
+  auto& key = groups_[rows_[row].group].key;
+  if (!expanded_.erase(key)) expanded_.insert(key);
+  ListView_SetItemState(lv_, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+  ListView_SetItemState(lv_, row, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+  refreshList();
+}
+
+static std::wstring editorLabel(const PluginRecord& r) {
+  if (r.editor == "ok") return L"OK";
+  if (r.editor == "none" || (!r.hasEditor && statusLoadable(r.status))) return L"—";
+  if (r.editor == "crashed") return L"Crashed";
+  if (r.editor == "hangs") return L"Hangs";
+  if (r.editor == "failed") return L"Failed";
+  return (r.hasEditor && statusLoadable(r.status)) ? L"not tested" : L"";
+}
+
+std::wstring Gui::cellText(int row, int col) const {
+  if (row < 0 || row >= (int)rows_.size()) return {};
+  const Group& g = groups_[rows_[row].group];
+  const bool header = rows_[row].member < 0;
+  const bool child = !header && g.recs.size() > 1;
+  const PluginRecord& rec = *rowRecord(row);
+  const bool other = rec.status == ScanStatus::NotPlugin || rec.status == ScanStatus::LoadFailed ||
+                     rec.status == ScanStatus::Unsupported;
+  switch (col) {
+    case 0:
+      if (header) return (expanded_.count(g.key) ? L"▾  " : L"▸  ") + W(rec.displayName());
+      if (child) return L"        " + W(fileNameOf(rec.path));
+      return W(rec.displayName());
+    case 1: return child ? std::wstring() : W(rec.vendor);
+    case 2: return other || child ? std::wstring() : (rec.isInstrument() ? L"Instrument" : L"Effect");
+    case 3: {
+      if (header) {
+        bool b32 = false, b64 = false;
+        for (auto& r : g.recs) (r.arch == "x86" ? b32 : b64) = true;
+        return b32 && b64 ? L"32+64" : b32 ? L"32" : L"64";
+      }
+      return rec.arch == "x86" ? L"32" : rec.arch == "x64" ? L"64" : W(rec.arch);
+    }
+    case 4: return statusLabel(rec.status);
+    case 5: {
+      if (!header) return editorLabel(rec);
+      std::wstring first;
+      bool same = true, any = false;
+      for (auto& r : g.recs) {
+        if (!statusLoadable(r.status)) continue;
+        auto l = editorLabel(r);
+        if (!any) first = l;
+        else if (l != first) same = false;
+        any = true;
+      }
+      return any ? (same ? first : L"mixed") : std::wstring();
+    }
+    case 6: {
+      if (!header) return W(rec.detail);
+      int ok = 0, bad = 0;
+      for (auto& r : g.recs) {
+        if (statusLoadable(r.status)) ++ok;
+        else ++bad;
+      }
+      wchar_t b[128];
+      swprintf(b, 128, L"%d files: %d work, %d with problems", (int)g.recs.size(), ok, bad);
+      return b;
+    }
+    case 7: return header ? W(dirOf(rec.path)) : W(rec.path);
+  }
+  return {};
 }
 
 void Gui::refreshPrograms() {
@@ -878,9 +1021,8 @@ void Gui::refreshScanStatus() {
 }
 
 void Gui::loadSelected(bool sandboxed) {
-  int sel = ListView_GetNextItem(lv_, -1, LVNI_SELECTED);
-  if (sel < 0 || sel >= (int)rows_.size()) return;
-  loadRecord(rows_[sel], sandboxed);
+  // A group row loads its best copy (working, preferably 64-bit); expand it to pick another.
+  if (const PluginRecord* r = rowRecord(ListView_GetNextItem(lv_, -1, LVNI_SELECTED))) loadRecord(*r, sandboxed);
 }
 
 void Gui::loadRecord(const PluginRecord& r, bool sandboxed) {
@@ -915,21 +1057,40 @@ void Gui::loadRecord(const PluginRecord& r, bool sandboxed) {
 
 void Gui::showContextMenu(int x, int y) {
   int sel = ListView_GetNextItem(lv_, -1, LVNI_SELECTED);
-  if (sel < 0 || sel >= (int)rows_.size()) return;
+  const PluginRecord* rp = rowRecord(sel);
+  if (!rp) return;
+  const PluginRecord r = *rp;
+  const bool group = rowIsGroup(sel);
+  const bool busy = Shared::get().scanner.running();
   HMENU m = CreatePopupMenu();
-  AppendMenuW(m, MF_STRING, ID_CTX_LOAD, L"Load");
+  std::wstring loadText = group ? L"Load best copy (" + W(fileNameOf(r.path)) + L")" : std::wstring(L"Load");
+  AppendMenuW(m, MF_STRING, ID_CTX_LOAD, loadText.c_str());
   AppendMenuW(m, MF_STRING, ID_CTX_LOAD_SANDBOXED, L"Load sandboxed (separate process)");
   AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-  AppendMenuW(m, MF_STRING | (Shared::get().scanner.running() ? MF_GRAYED : 0), ID_CTX_RESCAN, L"Test again");
+  if (group) {
+    bool open = expanded_.count(groups_[rows_[sel].group].key) != 0;
+    AppendMenuW(m, MF_STRING, ID_CTX_TOGGLE, open ? L"Collapse" : L"Show all copies");
+    AppendMenuW(m, MF_STRING | (busy ? MF_GRAYED : 0), ID_CTX_RESCAN, L"Test all copies again");
+  } else {
+    AppendMenuW(m, MF_STRING | (busy ? MF_GRAYED : 0), ID_CTX_RESCAN, L"Test again");
+  }
   AppendMenuW(m, MF_STRING, ID_CTX_EXPLORE, L"Show in Explorer");
   AppendMenuW(m, MF_STRING, ID_CTX_COPY, L"Copy path");
   int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, x, y, 0, root_, nullptr);
   DestroyMenu(m);
-  const PluginRecord r = rows_[sel];
   switch (cmd) {
     case ID_CTX_LOAD: loadRecord(r, false); break;
     case ID_CTX_LOAD_SANDBOXED: loadRecord(r, true); break;
-    case ID_CTX_RESCAN: startScan(false, false, {r.path}); break;
+    case ID_CTX_TOGGLE: toggleGroup(sel); break;
+    case ID_CTX_RESCAN: {
+      std::vector<std::string> files;
+      if (group)
+        for (auto& c : groups_[rows_[sel].group].recs) files.push_back(c.path);
+      else
+        files.push_back(r.path);
+      startScan(false, false, files);
+      break;
+    }
     case ID_CTX_EXPLORE: {
       std::wstring args = L"/select,\"" + W(r.path) + L"\"";
       ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
@@ -1230,12 +1391,24 @@ LRESULT Gui::listCustomDraw(NMLVCUSTOMDRAW* cd) {
     }
     case CDDS_ITEMPREPAINT | CDDS_SUBITEM: {
       int row = (int)cd->nmcd.dwItemSpec;
-      if (row < 0 || row >= (int)rows_.size()) return CDRF_DODEFAULT;
-      auto& r = rows_[row];
+      const PluginRecord* rp = rowRecord(row);
+      if (!rp) return CDRF_DODEFAULT;
+      auto& r = *rp;
+      const bool group = rowIsGroup(row);
+      SelectObject(cd->nmcd.hdc, group ? fontBold_ : font_);
       cd->clrText = kText;
-      if (cd->iSubItem == 4) cd->clrText = statusColor(r.status);
-      else if (cd->iSubItem == 3 && r.arch == "x86") cd->clrText = kBlue;
-      else if (cd->iSubItem >= 5 || cd->iSubItem == 1 || cd->iSubItem == 2) cd->clrText = kDim;
+      if (cd->iSubItem == 4) {
+        cd->clrText = statusColor(r.status);
+      } else if (cd->iSubItem == 5) {
+        auto t = cellText(row, 5);
+        cd->clrText = t == L"OK" ? kOk : (t == L"Crashed" || t == L"Hangs" || t == L"Failed") ? kBad
+                      : t == L"mixed"                                                       ? kWarn
+                                                                                            : kDim;
+      } else if (cd->iSubItem == 3 && cellText(row, 3) != L"64") {
+        cd->clrText = kBlue;
+      } else if (cd->iSubItem >= 6 || cd->iSubItem == 1 || cd->iSubItem == 2) {
+        cd->clrText = kDim;
+      }
       if (r.status == ScanStatus::NotPlugin || r.status == ScanStatus::Unsupported) cd->clrText = kGrey;
       return CDRF_NEWFONT;
     }
@@ -1487,29 +1660,31 @@ LRESULT Gui::onPage(HWND h, UINT m, WPARAM w, LPARAM l) {
           auto di = reinterpret_cast<NMLVDISPINFOW*>(l);
           int row = di->item.iItem;
           if (!(di->item.mask & LVIF_TEXT) || row < 0 || row >= (int)rows_.size()) return 0;
-          auto& rec = rows_[row];
-          std::wstring s;
-          switch (di->item.iSubItem) {
-            case 0: s = W(rec.displayName()); break;
-            case 1: s = W(rec.vendor); break;
-            case 2:
-              s = (rec.status == ScanStatus::NotPlugin || rec.status == ScanStatus::LoadFailed ||
-                   rec.status == ScanStatus::Unsupported)
-                      ? L""
-                      : (rec.isInstrument() ? L"Instrument" : L"Effect");
-              break;
-            case 3: s = rec.arch == "x86" ? L"32" : rec.arch == "x64" ? L"64" : W(rec.arch); break;
-            case 4: s = statusLabel(rec.status); break;
-            case 5: s = W(rec.detail); break;
-            case 6: s = W(rec.path); break;
-          }
-          wcsncpy_s(di->item.pszText, di->item.cchTextMax, s.c_str(), _TRUNCATE);
+          wcsncpy_s(di->item.pszText, di->item.cchTextMax, cellText(row, di->item.iSubItem).c_str(), _TRUNCATE);
           return 0;
         }
         case LVN_GETINFOTIPW: {
           auto tip = reinterpret_cast<NMLVGETINFOTIPW*>(l);
-          if (tip->iItem < 0 || tip->iItem >= (int)rows_.size()) return 0;
-          auto& rec = rows_[tip->iItem];
+          const PluginRecord* rp = rowRecord(tip->iItem);
+          if (!rp) return 0;
+          if (rowIsGroup(tip->iItem)) {
+            // Group: one line per copy.
+            auto& g = groups_[rows_[tip->iItem].group];
+            std::string t = rp->displayName() + " (" + std::to_string(g.recs.size()) + " files)";
+            int shown = 0;
+            for (auto& c : g.recs) {
+              if (++shown > 20) {
+                t += "\n...";
+                break;
+              }
+              t += "\n" + std::string(c.arch == "x86" ? "32" : "64") + "-bit  " + narrow(statusLabel(c.status)) +
+                   "  " + fileNameOf(c.path);
+            }
+            t += "\nDouble-click to show all copies; Load picks " + fileNameOf(rp->path);
+            wcsncpy_s(tip->pszText, tip->cchTextMax, W(t).c_str(), _TRUNCATE);
+            return 0;
+          }
+          auto& rec = *rp;
           std::string t = rec.displayName();
           if (!rec.vendor.empty()) t += " by " + rec.vendor;
           t += "\n" + std::string(rec.arch == "x86" ? "32-bit" : "64-bit") + ", " + narrow(statusLabel(rec.status));
@@ -1526,10 +1701,27 @@ LRESULT Gui::onPage(HWND h, UINT m, WPARAM w, LPARAM l) {
           wcsncpy_s(tip->pszText, tip->cchTextMax, W(t).c_str(), _TRUNCATE);
           return 0;
         }
-        case NM_DBLCLK: loadSelected(false); return 0;
-        case LVN_KEYDOWN:
-          if (reinterpret_cast<NMLVKEYDOWN*>(l)->wVKey == VK_RETURN) loadSelected(false);
+        case NM_CLICK: {
+          // Clicking the arrow of a group row opens / closes it.
+          auto ia = reinterpret_cast<NMITEMACTIVATE*>(l);
+          if (rowIsGroup(ia->iItem) && ia->iSubItem == 0 && ia->ptAction.x < S(28)) toggleGroup(ia->iItem);
           return 0;
+        }
+        case NM_DBLCLK: {
+          int row = ListView_GetNextItem(lv_, -1, LVNI_SELECTED);
+          if (rowIsGroup(row)) toggleGroup(row);
+          else loadSelected(false);
+          return 0;
+        }
+        case LVN_KEYDOWN: {
+          int row = ListView_GetNextItem(lv_, -1, LVNI_SELECTED);
+          WORD vk = reinterpret_cast<NMLVKEYDOWN*>(l)->wVKey;
+          bool open = rowIsGroup(row) && expanded_.count(groups_[rows_[row].group].key);
+          if (vk == VK_RETURN) loadSelected(false);
+          else if (vk == VK_RIGHT && rowIsGroup(row) && !open) toggleGroup(row);
+          else if (vk == VK_LEFT && rowIsGroup(row) && open) toggleGroup(row);
+          return 0;
+        }
         case LVN_COLUMNCLICK: {
           int col = reinterpret_cast<NMLISTVIEW*>(l)->iSubItem;
           if (col == sortColumn_) sortAscending_ = !sortAscending_;

@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -122,7 +123,24 @@ class Gui {
   int editorW_ = 0, editorH_ = 0;
   std::map<HWND, bool> toggles_;
 
-  std::vector<PluginRecord> rows_;  // filtered list shown
+  // The list is a two-level tree: plugins with the same name and vendor (Sylenth1 x25, 32- and
+  // 64-bit copies...) form one group row that expands to one row per file.
+  struct Group {
+    std::string key;
+    std::vector<PluginRecord> recs;  // sorted by path
+    int best = 0;                    // the copy "Load" picks
+  };
+  struct Row {
+    int group;
+    int member;  // -1: the header row of a group with several files
+  };
+  std::vector<Group> groups_;
+  std::vector<Row> rows_;
+  std::set<std::string> expanded_;
+  const PluginRecord* rowRecord(int row) const;  // the record a row loads (best copy for a group)
+  bool rowIsGroup(int row) const;
+  void toggleGroup(int row);
+  std::wstring cellText(int row, int col) const;
   int sortColumn_ = 0;
   bool sortAscending_ = true;
   bool wasScanning_ = false;
