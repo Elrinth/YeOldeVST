@@ -29,7 +29,7 @@ const clap_plugin_t* factoryCreate(const clap_plugin_factory_t*, const clap_host
 const clap_plugin_factory_t kFactory = {factoryCount, factoryDescriptor, factoryCreate};
 
 bool entryInit(const char*) { return true; }
-void entryDeinit() { yov::Gui::unregisterClasses(); }
+void entryDeinit() { yov::Gui::shutdown(); }
 const void* entryGetFactory(const char* id) {
   return std::strcmp(id, CLAP_PLUGIN_FACTORY_ID) == 0 ? &kFactory : nullptr;
 }

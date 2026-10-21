@@ -1,3 +1,4 @@
+// Windows side of common/Seh.h: structured exception handling.
 #include "common/Seh.h"
 
 #include <windows.h>
@@ -70,8 +71,7 @@ std::string SehFault::describe() const {
   return buf;
 }
 
-void sehCapture(void* exceptionPointers, SehFault* fault) {
-  auto ep = static_cast<EXCEPTION_POINTERS*>(exceptionPointers);
+static void sehCapture(EXCEPTION_POINTERS* ep, SehFault* fault) {
   fault->code = ep->ExceptionRecord->ExceptionCode;
   fault->address = ep->ExceptionRecord->ExceptionAddress;
   fault->caller = nullptr;
@@ -107,6 +107,21 @@ bool sehInvoke(SehFn fn, void* ctx, SehFault* fault) {
     if (fault && fault->code == EXCEPTION_STACK_OVERFLOW) _resetstkoflw();
     return false;
   }
+}
+
+static FaultHandler gUnhandled = nullptr;
+
+static LONG WINAPI unhandledFilter(EXCEPTION_POINTERS* ep) {
+  SehFault f;
+  sehCapture(ep, &f);
+  if (gUnhandled) gUnhandled(f);
+  TerminateProcess(GetCurrentProcess(), f.code);
+  return EXCEPTION_EXECUTE_HANDLER;
+}
+
+void setUnhandledFaultHandler(FaultHandler handler) {
+  gUnhandled = handler;
+  SetUnhandledExceptionFilter(unhandledFilter);
 }
 
 }  // namespace yov

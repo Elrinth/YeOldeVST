@@ -1,13 +1,17 @@
 #include "host/Vst2Plugin.h"
 
 #include "common/Util.h"
-
-#include <windows.h>
-
-#include <float.h>
-#include <xmmintrin.h>
+#include "platform/DynLib.h"
 
 #include <cstring>
+
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+#define YOV_X86_FPU 1
+#include <xmmintrin.h>
+#if defined(_M_IX86)
+#include <float.h>
+#endif
+#endif
 
 using namespace vst2;
 
@@ -25,6 +29,7 @@ thread_local Vst2Plugin* tlsHostSetting = nullptr;
 
 // Plugins often leave the FPU in odd states (unmasked exceptions, denormals on, x87 precision
 // changed). Save and restore around every audio call, and run them with denormals flushed.
+#if defined(YOV_X86_FPU)
 struct FpuGuard {
   unsigned int mxcsr;
 #if defined(_M_IX86)
@@ -44,6 +49,19 @@ struct FpuGuard {
 #endif
   }
 };
+#elif defined(__aarch64__)
+struct FpuGuard {
+  uint64_t fpcr;
+  FpuGuard() {
+    __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr));
+    uint64_t v = (fpcr | (1ull << 24) /*FZ*/) & ~(0x9F00ull) /*trap enables off*/;
+    __asm__ __volatile__("msr fpcr, %0" : : "r"(v));
+  }
+  ~FpuGuard() { __asm__ __volatile__("msr fpcr, %0" : : "r"(fpcr)); }
+};
+#else
+struct FpuGuard {};
+#endif
 
 // ---- calling into the plugin ----
 // MSVC's 32-bit code only keeps the stack 4-byte aligned, but plugins built with GCC or Intel's
@@ -141,35 +159,6 @@ inline float callGetParameter(GetParameterProc f, AEffect* e, int32_t idx) { ret
 inline AEffect* callEntry(EntryProc f, HostCallback cb) { return f(cb); }
 #endif
 
-std::string lastErrorText(DWORD err) {
-  wchar_t* msg = nullptr;
-  FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr,
-                 err, 0, (LPWSTR)&msg, 0, nullptr);
-  std::string s = msg ? trim(narrow(msg)) : "error " + std::to_string(err);
-  LocalFree(msg);
-  return s;
-}
-
-// Copy a C string a plugin wrote into an over-sized buffer, stopping at the terminator.
-std::string fromPluginString(const char* buf, size_t cap) {
-  size_t n = strnlen(buf, cap);
-  std::string s(buf, n);
-  // Old plugins return ANSI (Windows-1252 etc.); convert so the UI shows them right.
-  bool ascii = true;
-  for (unsigned char c : s)
-    if (c >= 0x80) ascii = false;
-  if (!ascii) {
-    int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), (int)s.size(), nullptr, 0);
-    if (wn <= 0) {
-      wn = MultiByteToWideChar(CP_ACP, 0, s.data(), (int)s.size(), nullptr, 0);
-      std::wstring w(wn, L'\0');
-      MultiByteToWideChar(CP_ACP, 0, s.data(), (int)s.size(), w.data(), wn);
-      s = narrow(w);
-    }
-  }
-  return trim(s);
-}
-
 }  // namespace
 
 template <class F>
@@ -222,15 +211,13 @@ std::unique_ptr<Vst2Plugin> Vst2Plugin::load(const std::string& path, int32_t sh
   // for the duration of the load, then put the host's directory back.
   struct CwdScope {
     std::unique_lock<std::mutex> lk;
-    std::wstring old;
+    std::string old;
     explicit CwdScope(const std::string& dir) : lk(cwdMutex()) {
-      wchar_t buf[4096];
-      DWORD n = GetCurrentDirectoryW(4096, buf);
-      if (n > 0 && n < 4096) old.assign(buf, n);
-      if (!dir.empty()) SetCurrentDirectoryW(widen(dir).c_str());
+      old = currentDir();
+      if (!dir.empty()) setCurrentDir(dir);
     }
     ~CwdScope() {
-      if (!old.empty()) SetCurrentDirectoryW(old.c_str());
+      if (!old.empty()) setCurrentDir(old);
     }
     static std::mutex& cwdMutex() {
       static std::mutex m;
@@ -238,14 +225,10 @@ std::unique_ptr<Vst2Plugin> Vst2Plugin::load(const std::string& path, int32_t sh
     }
   } cwd(dirOf(path));
 
-  // Don't let a missing dependency pop up a system error box.
-  UINT oldMode = SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
-  HMODULE mod = nullptr;
+  void* mod = nullptr;
   SehFault fault;
-  bool ok = sehGuard([&] { mod = LoadLibraryExW(widen(path).c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH); },
-                     &fault);
-  DWORD err = GetLastError();
-  SetErrorMode(oldMode);
+  std::string loadError;
+  bool ok = sehGuard([&] { mod = dynOpen(path, loadError); }, &fault);
   if (!ok) {
     error = "crashed while loading DLL: " + fault.describe();
     p->dead_ = true;  // leak whatever got mapped
@@ -253,23 +236,18 @@ std::unique_ptr<Vst2Plugin> Vst2Plugin::load(const std::string& path, int32_t sh
     return nullptr;
   }
   if (!mod) {
-    if (err == ERROR_MOD_NOT_FOUND)
-      error = "a DLL this plugin needs is missing (" + lastErrorText(err) + ")";
-    else if (err == ERROR_BAD_EXE_FORMAT)
-      error = "wrong architecture (32-bit vs 64-bit)";
-    else
-      error = "LoadLibrary failed: " + lastErrorText(err);
+    error = loadError;
     return nullptr;
   }
   p->module_ = mod;
 
-  EntryProc entry = (EntryProc)GetProcAddress(mod, "VSTPluginMain");
-  if (!entry) entry = (EntryProc)GetProcAddress(mod, "main");
-  if (!entry) entry = (EntryProc)GetProcAddress(mod, "main_plugin");
-  if (!entry) entry = (EntryProc)GetProcAddress(mod, "_main");
+  EntryProc entry = (EntryProc)dynSymbol(mod, "VSTPluginMain");
+  if (!entry) entry = (EntryProc)dynSymbol(mod, "main");
+  if (!entry) entry = (EntryProc)dynSymbol(mod, "main_plugin");
+  if (!entry) entry = (EntryProc)dynSymbol(mod, "_main");
   if (!entry) {
     error = "no VST2 entry point (VSTPluginMain/main)";
-    FreeLibrary(mod);
+    dynClose(mod);
     p->module_ = nullptr;
     return nullptr;
   }
@@ -288,13 +266,13 @@ std::unique_ptr<Vst2Plugin> Vst2Plugin::load(const std::string& path, int32_t sh
   }
   if (!fx) {
     error = "entry point returned no plugin (it refused to start, maybe a demo/licence check)";
-    FreeLibrary(mod);
+    dynClose(mod);
     p->module_ = nullptr;
     return nullptr;
   }
   if (fx->magic != kMagic) {
     error = "entry point returned an invalid plugin (bad magic)";
-    FreeLibrary(mod);
+    dynClose(mod);
     p->module_ = nullptr;
     return nullptr;
   }
@@ -324,8 +302,8 @@ Vst2Plugin::~Vst2Plugin() {
   }
   if (module_ && !dead()) {
     SehFault f;
-    HMODULE m = (HMODULE)module_;
-    sehGuard([&] { FreeLibrary(m); }, &f);
+    void* m = module_;
+    sehGuard([&] { dynClose(m); }, &f);
   }
 }
 
@@ -419,7 +397,7 @@ void Vst2Plugin::suspend() {
 
 bool Vst2Plugin::process(float** inputs, float** outputs, int32_t frames) {
   if (!fx_ || dead()) return false;
-  audioThreadId_.store(GetCurrentThreadId(), std::memory_order_relaxed);
+  audioThreadId_.store(currentThreadId(), std::memory_order_relaxed);
   FpuGuard fpu;
   auto fx = fx_;
   if (canReplacing()) {
@@ -433,7 +411,7 @@ bool Vst2Plugin::process(float** inputs, float** outputs, int32_t frames) {
 
 bool Vst2Plugin::processEvents(VstEvents* events) {
   if (!fx_ || dead()) return false;
-  audioThreadId_.store(GetCurrentThreadId(), std::memory_order_relaxed);
+  audioThreadId_.store(currentThreadId(), std::memory_order_relaxed);
   FpuGuard fpu;
   dispatch(effProcessEvents, 0, 0, events);
   return !dead();
@@ -551,7 +529,7 @@ intptr_t Vst2Plugin::onHostCallback(int32_t opcode, int32_t index, intptr_t valu
     case audioMasterGetInputLatency: return 0;
     case audioMasterGetOutputLatency: return 0;
     case audioMasterGetCurrentProcessLevel:
-      return GetCurrentThreadId() == audioThreadId_.load(std::memory_order_relaxed) ? kVstProcessLevelRealtime
+      return currentThreadId() == audioThreadId_.load(std::memory_order_relaxed) ? kVstProcessLevelRealtime
                                                                                     : kVstProcessLevelUser;
     case audioMasterGetAutomationState: return 1;  // off
     case audioMasterGetVendorString:

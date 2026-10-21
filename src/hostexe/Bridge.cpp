@@ -9,8 +9,8 @@
 #include "common/Seh.h"
 #include "common/Util.h"
 #include "host/Vst2Plugin.h"
-
-#include <windows.h>
+#include "platform/Helper.h"
+#include "platform/Ipc.h"
 
 #include <algorithm>
 #include <atomic>
@@ -29,21 +29,12 @@ namespace {
 
 Shared* gShared = nullptr;
 
-LONG WINAPI bridgeUnhandled(EXCEPTION_POINTERS* ep) {
+void bridgeUnhandled(const SehFault& f) {
   if (gShared) {
-    SehFault f;
-    sehCapture(ep, &f);
     std::string d = f.describe();
     snprintf(gShared->deathReason, sizeof gShared->deathReason, "%s", d.c_str());
     gShared->dead = 1;
   }
-  TerminateProcess(GetCurrentProcess(), ep->ExceptionRecord->ExceptionCode);
-  return EXCEPTION_EXECUTE_HANDLER;
-}
-
-LRESULT CALLBACK containerProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-  if (m == WM_ERASEBKGND) return 1;
-  return DefWindowProcW(h, m, w, l);
 }
 
 class Server final : public Vst2Plugin::Listener {
@@ -58,7 +49,7 @@ class Server final : public Vst2Plugin::Listener {
   void vstBeginEdit(int32_t index) override { push({NBeginEdit, index, 0, 0, 0}); }
   void vstEndEdit(int32_t index) override { push({NEndEdit, index, 0, 0, 0}); }
   bool vstSizeWindow(int32_t w, int32_t h) override {
-    if (container_) SetWindowPos(container_, nullptr, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    if (container_) helper::containerResize(container_, w, h);
     push({NSizeWindow, 0, 0, w, h});
     return true;
   }
@@ -89,21 +80,26 @@ class Server final : public Vst2Plugin::Listener {
 
  private:
   void push(const Notify& n) {
-    while (InterlockedCompareExchange((volatile LONG*)&sh_->ringLock, 1, 0) != 0) YieldProcessor();
+    std::atomic_ref<int32_t> lock(sh_->ringLock);
+    int32_t expected = 0;
+    while (!lock.compare_exchange_weak(expected, 1, std::memory_order_acquire)) {
+      expected = 0;
+      std::this_thread::yield();
+    }
     if (sh_->ringWrite - sh_->ringRead < kRingSize) {
       sh_->ring[sh_->ringWrite % kRingSize] = n;
-      MemoryBarrier();
+      std::atomic_thread_fence(std::memory_order_seq_cst);
       sh_->ringWrite = sh_->ringWrite + 1;
     }
-    InterlockedExchange((volatile LONG*)&sh_->ringLock, 0);
-    SetEvent(notify_);
+    lock.store(0, std::memory_order_release);
+    notify_.signal();
   }
 
   void checkDead() {
     if (plug_ && plug_->dead() && !sh_->dead) {
       std::string r = plug_->deathReason() + " (in " + plug_->deathStage() + ")";
       snprintf(sh_->deathReason, sizeof sh_->deathReason, "%s", r.c_str());
-      MemoryBarrier();
+      std::atomic_thread_fence(std::memory_order_seq_cst);
       sh_->dead = 1;
     }
   }
@@ -136,14 +132,9 @@ class Server final : public Vst2Plugin::Listener {
     Ctrl& c = sh_->ctrl;
     std::vector<uint8_t> v;
     if (c.bigSize) {
-      HANDLE m = OpenFileMappingA(FILE_MAP_READ, FALSE, c.bigName);
-      if (m) {
-        if (void* p = MapViewOfFile(m, FILE_MAP_READ, 0, 0, c.bigSize)) {
-          v.assign((uint8_t*)p, (uint8_t*)p + c.bigSize);
-          UnmapViewOfFile(p);
-        }
-        CloseHandle(m);
-      }
+      SharedMemory m;
+      if (m.open(std::string(c.bigName, strnlen(c.bigName, sizeof c.bigName)), c.bigSize, true))
+        v.assign((uint8_t*)m.data(), (uint8_t*)m.data() + c.bigSize);
     } else {
       v.assign(c.data, c.data + std::min(c.dataSize, kCtrlDataSize));
     }
@@ -159,31 +150,31 @@ class Server final : public Vst2Plugin::Listener {
       c.dataSize = (uint32_t)n;
       return;
     }
-    char nm[96];
-    snprintf(nm, sizeof nm, "%s-big%u", base_.c_str(), c.seq);
-    bigReply_ = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, (DWORD)((uint64_t)n >> 32),
-                                   (DWORD)n, nm);
-    if (!bigReply_) return;
-    if (void* p = MapViewOfFile(bigReply_, FILE_MAP_WRITE, 0, 0, n)) {
-      memcpy(p, data, n);
-      UnmapViewOfFile(p);
-      snprintf(c.bigName, sizeof c.bigName, "%s", nm);
-      c.bigSize = (uint32_t)n;
-    }
+    // Too big for the control block: a separate mapping, kept until the next request.
+    std::string nm = ipcName(base_, ("-big" + std::to_string(c.seq)).c_str());
+    if (!bigReply_.create(nm, n)) return;
+    memcpy(bigReply_.data(), data, n);
+    snprintf(c.bigName, sizeof c.bigName, "%s", nm.c_str());
+    c.bigSize = (uint32_t)n;
   }
   void reply(const std::string& s) { reply(s.data(), s.size()); }
+
+  void closeContainer() {
+    if (container_) helper::containerDestroy(container_);
+    container_ = nullptr;
+  }
 
   void handleCtrl();
   void audioLoop();
 
   std::string base_;
   Shared* sh_ = nullptr;
-  HANDLE map_ = nullptr, ctrlReq_ = nullptr, ctrlResp_ = nullptr, audioReq_ = nullptr, audioResp_ = nullptr,
-         notify_ = nullptr, parent_ = nullptr;
-  HANDLE bigReply_ = nullptr;
+  SharedMemory map_;
+  IpcEvent ctrlReq_, ctrlResp_, audioReq_, audioResp_, notify_;
+  ProcessWatch parent_;
+  SharedMemory bigReply_;
   std::unique_ptr<Vst2Plugin> plug_;
-  HWND container_ = nullptr;
-  std::wstring containerClass_;
+  void* container_ = nullptr;
   std::atomic<bool> quit_{false};
   std::mutex midiOutM_;
   std::vector<MidiEvent> midiOut_;
@@ -192,10 +183,7 @@ class Server final : public Vst2Plugin::Listener {
 
 void Server::handleCtrl() {
   Ctrl& c = sh_->ctrl;
-  if (bigReply_) {
-    CloseHandle(bigReply_);
-    bigReply_ = nullptr;
-  }
+  bigReply_.close();
   c.result = 0;
   c.bigSize = 0;
   uint32_t op = c.op;
@@ -323,35 +311,23 @@ void Server::handleCtrl() {
     case OpEditorOpen: {
       c.dataSize = 0;
       if (!loaded || plug_->editorIsOpen()) break;
-      HWND parent = (HWND)(intptr_t)c.value;
       int w = 0, h = 0;
       plug_->editorGetRect(w, h);
-      container_ = CreateWindowExW(WS_EX_NOPARENTNOTIFY, containerClass_.c_str(), L"",
-                                   WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, 0, 0, std::max(w, 1),
-                                   std::max(h, 1), parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+      container_ = helper::containerCreate(c.value, w, h);
       if (!container_ || !plug_->editorOpen(container_)) {
-        if (container_) DestroyWindow(container_);
-        container_ = nullptr;
+        closeContainer();
         break;
       }
-      if (plug_->editorGetRect(w, h) && w > 0 && h > 0)
-        SetWindowPos(container_, nullptr, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+      if (plug_->editorGetRect(w, h) && w > 0 && h > 0) helper::containerResize(container_, w, h);
       if (w <= 0 || h <= 0) {
-        HWND child = GetWindow(container_, GW_CHILD);
-        RECT r{};
-        if (child && GetWindowRect(child, &r)) {
-          w = r.right - r.left;
-          h = r.bottom - r.top;
-          SetWindowPos(container_, nullptr, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-        }
+        if (helper::containerChildSize(container_, w, h)) helper::containerResize(container_, w, h);
       }
       c.result = (std::max(w, 1) << 16) | (std::max(h, 1) & 0xFFFF);
       break;
     }
     case OpEditorClose:
       if (plug_ && plug_->editorIsOpen() && !plug_->dead()) plug_->editorClose();
-      if (container_) DestroyWindow(container_);
-      container_ = nullptr;
+      closeContainer();
       c.dataSize = 0;
       break;
     case OpRefreshParams:
@@ -360,28 +336,19 @@ void Server::handleCtrl() {
       break;
     case OpQuit:
       if (plug_ && plug_->editorIsOpen() && !plug_->dead()) plug_->editorClose();
-      if (container_) DestroyWindow(container_);
-      container_ = nullptr;
+      closeContainer();
       quit_ = true;
       c.result = 1;
       c.dataSize = 0;
       break;
   }
   checkDead();
-  MemoryBarrier();
-  SetEvent(ctrlResp_);
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  ctrlResp_.signal();
 }
 
 void Server::audioLoop() {
-  // Ask the scheduler for audio-thread treatment.
-  if (HMODULE avrt = LoadLibraryW(L"avrt.dll")) {
-    using Fn = HANDLE(WINAPI*)(LPCWSTR, LPDWORD);
-    if (auto f = (Fn)GetProcAddress(avrt, "AvSetMmThreadCharacteristicsW")) {
-      DWORD idx = 0;
-      f(L"Pro Audio", &idx);
-    }
-  }
-  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+  helper::boostAudioThread();
 
   std::vector<vst2::VstMidiEvent> midi(kMaxMidi);
   std::vector<vst2::VstMidiSysexEvent> sysex(kMaxSysex);
@@ -394,9 +361,9 @@ void Server::audioLoop() {
     outPtr[c] = a.out[c];
   }
   while (!quit_.load()) {
-    if (WaitForSingleObject(audioReq_, 200) != WAIT_OBJECT_0) continue;
+    if (!audioReq_.wait(200)) continue;
     uint32_t seq = a.seq;
-    MemoryBarrier();
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     a.ok = 0;
     if (plug_ && !plug_->dead() && a.frames > 0 && a.frames <= (int32_t)kMaxFrames) {
       for (int i = 0; i < std::min<int>(a.numParams, kMaxParamChanges); ++i) {
@@ -456,65 +423,44 @@ void Server::audioLoop() {
       midiOut_.clear();
       sysexOut_.clear();
     }
-    MemoryBarrier();
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     a.doneSeq = seq;
-    SetEvent(audioResp_);
+    audioResp_.signal();
   }
 }
 
 int Server::run(const std::string& name) {
   base_ = name;
-  map_ = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, name.c_str());
-  if (!map_) return 10;
-  sh_ = (Shared*)MapViewOfFile(map_, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Shared));
+  if (!map_.open(name, sizeof(Shared))) return 10;
+  sh_ = (Shared*)map_.data();
   if (!sh_ || sh_->magic != kMagic || sh_->version != kVersion) return 11;
   gShared = sh_;
-  SetUnhandledExceptionFilter(bridgeUnhandled);
-  SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
-  CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  setUnhandledFaultHandler(bridgeUnhandled);
+  helper::init(false);
 
-  char nm[160];
-  auto openEv = [&](const char* suffix) {
-    objectName(nm, sizeof nm, name.c_str(), suffix);
-    return OpenEventA(EVENT_ALL_ACCESS, FALSE, nm);
-  };
-  ctrlReq_ = openEv("-creq");
-  ctrlResp_ = openEv("-cresp");
-  audioReq_ = openEv("-areq");
-  audioResp_ = openEv("-aresp");
-  notify_ = openEv("-notify");
-  parent_ = OpenProcess(SYNCHRONIZE, FALSE, sh_->clientPid);
-  if (!ctrlReq_ || !ctrlResp_ || !audioReq_ || !audioResp_ || !notify_ || !parent_) return 12;
+  IpcEvent* events[] = {&ctrlReq_, &ctrlResp_, &audioReq_, &audioResp_, &notify_};
+  for (int i = 0; i < 5; ++i)
+    if (!events[i]->open(ipcName(name, kWakeSuffix[i]), &sh_->wake[i])) return 12;
+  if (!parent_.open(sh_->clientPid)) return 12;
 
-  containerClass_ = L"YeOldeVSTBridgeEditor";
-  WNDCLASSW wc{};
-  wc.lpfnWndProc = containerProc;
-  wc.hInstance = GetModuleHandleW(nullptr);
-  wc.lpszClassName = containerClass_.c_str();
-  wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-  RegisterClassW(&wc);
-
-  sh_->bridgePid = GetCurrentProcessId();
+  sh_->bridgePid = currentProcessId();
   sh_->ready = 1;
   std::thread audio([this] { audioLoop(); });
 
-  HANDLE waits[2] = {ctrlReq_, parent_};
-  ULONGLONG lastIdle = 0, lastParams = 0;
+  uint64_t lastIdle = 0, lastParams = 0;
   while (!quit_.load()) {
-    DWORD r = MsgWaitForMultipleObjects(2, waits, FALSE, 15, QS_ALLINPUT);
-    if (r == WAIT_OBJECT_0) {
+    WaitResult r = waitForRequest(ctrlReq_, parent_, 15);
+    if (r == WaitResult::Signaled) {
       handleCtrl();
-    } else if (r == WAIT_OBJECT_0 + 1) {
+    } else if (r == WaitResult::ProcessEnded) {
       break;  // the DAW went away
-    } else if (r == WAIT_OBJECT_0 + 2) {
-      MSG msg;
-      int budget = 200;
-      while (budget-- > 0 && PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-      }
+    } else if (r == WaitResult::Messages) {
+      helper::pumpMessages(200);
     }
-    ULONGLONG now = GetTickCount64();
+#ifndef _WIN32
+    helper::pumpMessages(200);  // our own X connection (the editor container)
+#endif
+    uint64_t now = nowMs();
     if (now - lastIdle >= 30) {
       lastIdle = now;
       if (plug_ && plug_->editorIsOpen()) {
@@ -531,14 +477,13 @@ int Server::run(const std::string& name) {
   quit_ = true;
   audio.join();
   if (plug_ && !plug_->dead()) plug_.reset();
-  TerminateProcess(GetCurrentProcess(), 0);  // skip DLL teardown of whatever the plugin left
-  return 0;
+  helper::exitNow(0);  // skip DLL teardown of whatever the plugin left
 }
 
 }  // namespace
 
 int runBridge(const std::string& name) {
-  static Server server;  // keeps the plugin alive until TerminateProcess
+  static Server server;  // keeps the plugin alive until the process ends
   return server.run(name);
 }
 

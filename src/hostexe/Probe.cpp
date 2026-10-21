@@ -1,14 +1,14 @@
 #include "hostexe/Probe.h"
 
+#include "common/ModuleInfo.h"
 #include "common/Seh.h"
 #include "common/Util.h"
 #include "host/Vst2Plugin.h"
+#include "platform/Helper.h"
 
-#include <windows.h>
-
+#include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <map>
 #include <thread>
 #include <cmath>
 #include <cstdio>
@@ -21,7 +21,6 @@ namespace yov {
 
 namespace {
 
-HANDLE gOut = INVALID_HANDLE_VALUE;
 const char* gStage = "start";
 
 void emit(const char* kind, const std::string& text) {
@@ -30,9 +29,7 @@ void emit(const char* kind, const std::string& text) {
   line += ' ';
   for (char c : text) line += (c == '\n' || c == '\r') ? ' ' : c;
   line += '\n';
-  DWORD w;
-  WriteFile(gOut, line.data(), (DWORD)line.size(), &w, nullptr);
-  FlushFileBuffers(gOut);
+  helper::writeStdout(line);
 }
 
 void info(const char* key, const std::string& value) { emit("info", std::string(key) + "\t" + value); }
@@ -45,19 +42,13 @@ void stage(const char* s) {
 
 // Debug aid: YOV_PROBE_SKIP=params,state ... skips those stages.
 bool skipped(const char* s) {
-  char buf[256] = {};
-  if (!GetEnvironmentVariableA("YOV_PROBE_SKIP", buf, sizeof buf)) return false;
-  return std::strstr(buf, s) != nullptr;
+  std::string v;
+  if (!getEnv("YOV_PROBE_SKIP", v)) return false;
+  return v.find(s) != std::string::npos;
 }
 
 // Last line of defence: something faulted outside our guards (a plugin thread, a destructor).
-LONG WINAPI unhandledFilter(EXCEPTION_POINTERS* ep) {
-  SehFault f;
-  sehCapture(ep, &f);
-  emit("fault", std::string(gStage) + "\t" + f.describe());
-  TerminateProcess(GetCurrentProcess(), f.code);
-  return EXCEPTION_EXECUTE_HANDLER;
-}
+void unhandledFault(const SehFault& f) { emit("fault", std::string(gStage) + "\t" + f.describe()); }
 
 struct Listener : Vst2Plugin::Listener {
   int sizeRequests = 0;
@@ -67,103 +58,21 @@ struct Listener : Vst2Plugin::Listener {
   }
 };
 
-// ---- popup eater ----------------------------------------------------------------------------
-// During a scan nobody is there to click a plugin's nag screen, licence prompt or error box. A
-// watchdog thread finds top-level windows this process opens (other than our editor test
-// window), reports their text, and dismisses them so the probe can carry on instead of hanging.
-// Only the scanner does this; a plugin loaded for real shows its dialogs as usual.
-
-HWND gProbeWindow = nullptr;
-std::atomic<bool> gEaterRun{true};
-
-struct PopupScan {
-  DWORD pid;
-  std::vector<HWND> found;
-};
-
-BOOL CALLBACK collectPopups(HWND h, LPARAM lp) {
-  auto* ps = reinterpret_cast<PopupScan*>(lp);
-  DWORD pid = 0;
-  GetWindowThreadProcessId(h, &pid);
-  if (pid != ps->pid || h == gProbeWindow || !IsWindowVisible(h)) return TRUE;
-  if (GetWindow(h, GW_OWNER) == gProbeWindow && gProbeWindow) {
-    // Owned by the editor test window: could be part of the editor (tool palette); still a popup
-    // if it is a dialog.
-    wchar_t cls[64] = {};
-    GetClassNameW(h, cls, 64);
-    if (wcscmp(cls, L"#32770") != 0) return TRUE;
-  }
-  ps->found.push_back(h);
-  return TRUE;
-}
-
-BOOL CALLBACK collectText(HWND h, LPARAM lp) {
-  auto* out = reinterpret_cast<std::wstring*>(lp);
-  wchar_t cls[32] = {};
-  GetClassNameW(h, cls, 32);
-  if (_wcsicmp(cls, L"Static") == 0 || _wcsicmp(cls, L"Edit") == 0 || _wcsicmp(cls, L"RichEdit20W") == 0) {
-    wchar_t t[512] = {};
-    GetWindowTextW(h, t, 512);
-    if (t[0]) {
-      if (!out->empty()) *out += L" ";
-      *out += t;
-    }
-  }
-  return out->size() < 400;
-}
-
-void popupEater() {
-  std::map<HWND, int> attempts;
-  while (gEaterRun.load()) {
-    Sleep(250);
-    PopupScan ps{GetCurrentProcessId(), {}};
-    EnumWindows(collectPopups, (LPARAM)&ps);
-    for (HWND h : ps.found) {
-      int& n = attempts[h];
-      if (n == 0) {
-        wchar_t title[256] = {};
-        GetWindowTextW(h, title, 256);
-        std::wstring text;
-        EnumChildWindows(h, collectText, (LPARAM)&text);
-        std::string desc = narrow(title);
-        if (!text.empty()) desc += (desc.empty() ? "" : ": ") + narrow(text);
-        if (desc.empty()) desc = "(untitled window)";
-        if (desc.size() > 300) desc = desc.substr(0, 300) + "...";
-        emit("popup", desc);
-      }
-      // Escalate: Cancel, then No / OK, then close.
-      wchar_t cls[64] = {};
-      GetClassNameW(h, cls, 64);
-      bool dialog = wcscmp(cls, L"#32770") == 0;
-      if (dialog && n == 0) PostMessageW(h, WM_COMMAND, IDCANCEL, 0);
-      else if (dialog && n == 1) PostMessageW(h, WM_COMMAND, IDNO, 0);
-      else if (dialog && n == 2) PostMessageW(h, WM_COMMAND, IDOK, 0);
-      else PostMessageW(h, WM_CLOSE, 0, 0);
-      ++n;
-    }
-  }
-}
-
-LRESULT CALLBACK probeWndProc(HWND h, UINT m, WPARAM w, LPARAM l) { return DefWindowProcW(h, m, w, l); }
-
 void pump(int ms, Vst2Plugin& p) {
-  auto end = GetTickCount64() + ms;
-  while (GetTickCount64() < end && !p.dead()) {
-    MSG msg;
-    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-      TranslateMessage(&msg);
-      DispatchMessageW(&msg);
-    }
+  auto end = nowMs() + ms;
+  while (nowMs() < end && !p.dead()) {
+    helper::pumpMessages(1 << 30);
     p.editorIdle();
-    Sleep(15);
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
   }
 }
 
 int finish(int code) {
   // Skip static destructors / DLL detach of whatever the plugin left behind.
-  TerminateProcess(GetCurrentProcess(), (UINT)code);
-  return code;
+  helper::exitNow(code);
 }
+
+void reportPopup(const std::string& text) { emit("popup", text); }
 
 int faulted(Vst2Plugin& p) {
   emit("fault", p.deathStage() + "\t" + p.deathReason());
@@ -173,13 +82,11 @@ int faulted(Vst2Plugin& p) {
 }  // namespace
 
 int runProbe(const ProbeOptions& opt) {
-  gOut = GetStdHandle(STD_OUTPUT_HANDLE);
-  SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
-  SetUnhandledExceptionFilter(unhandledFilter);
-  CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  helper::init(true);
+  setUnhandledFaultHandler(unhandledFault);
 
-  emit("arch", sizeof(void*) == 8 ? "x64" : "x86");
-  std::thread(popupEater).detach();  // process ends via TerminateProcess, no join needed
+  emit("arch", archName(nativeArch()));
+  helper::startPopupEater(reportPopup);
   stage("load");
   Listener listener;
   std::string err;
@@ -361,17 +268,11 @@ int runProbe(const ProbeOptions& opt) {
 
   if ((opt.testEditor || opt.editorOnly) && p.hasEditor()) {
     stage("editor");
-    WNDCLASSW wc{};
-    wc.lpfnWndProc = probeWndProc;
-    wc.hInstance = GetModuleHandleW(nullptr);
-    wc.lpszClassName = L"YeOldeVSTProbe";
-    RegisterClassW(&wc);
-    // Real hosts show the parent window; some editors fail with an invisible one. Show it far
-    // off-screen, without activating it, so nothing flashes on the user's desktop.
-    HWND wnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, wc.lpszClassName, L"probe", WS_POPUP, -32000,
-                               -32000, 1600, 1200, nullptr, nullptr, wc.hInstance, nullptr);
-    gProbeWindow = wnd;
-    ShowWindow(wnd, SW_SHOWNOACTIVATE);
+    void* wnd = helper::probeWindowCreate();
+    if (!wnd) {
+      emit("error", "no display to open the editor on");
+      return finish(2);
+    }
     int w = 0, h = 0;
     p.editorGetRect(w, h);
     if (!p.editorOpen(wnd)) {
@@ -389,7 +290,7 @@ int runProbe(const ProbeOptions& opt) {
       p.editorClose();
       if (p.dead()) return faulted(p);
     }
-    DestroyWindow(wnd);
+    helper::probeWindowDestroy(wnd);
   }
 
   stage("suspend");
