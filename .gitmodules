@@ -1,0 +1,9 @@
+[submodule "external/vst3sdk"]
+	path = external/vst3sdk
+	url = https://github.com/steinbergmedia/vst3sdk.git
+[submodule "external/clap"]
+	path = external/clap
+	url = https://github.com/free-audio/clap.git
+[submodule "external/clap-wrapper"]
+	path = external/clap-wrapper
+	url = https://github.com/free-audio/clap-wrapper.git

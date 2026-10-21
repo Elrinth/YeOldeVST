@@ -1,0 +1,165 @@
+// The YeOldeVST CLAP plugin (also exposed as VST3 through clap-wrapper).
+//
+// Two flavours share this class: an instrument (notes in, stereo out) and an effect (stereo in,
+// notes in, stereo out). Each instance hosts at most one VST 1.x/2.x plugin.
+#pragma once
+
+#include "common/PluginDb.h"
+#include "plugin/HostedPlugin.h"
+#include "scan/Scanner.h"
+
+#include <clap/clap.h>
+
+#include <atomic>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
+
+namespace yov {
+
+class Gui;
+
+// Fixed number of parameter slots shown to the DAW. Unused slots are hidden.
+constexpr uint32_t kMaxParams = 1024;
+
+// One process-wide set of settings / database / scanner shared by every instance.
+struct Shared {
+  Settings settings;
+  PluginDb db;
+  Scanner scanner{db};
+  static Shared& get();
+};
+
+class Plugin final : public HostedPlugin::Listener {
+ public:
+  Plugin(const clap_host_t* host, bool instrument);
+  ~Plugin() override;
+
+  static const clap_plugin_descriptor_t* descriptor(bool instrument);
+  const clap_plugin_t* clapPlugin() const { return &plugin_; }
+
+  // ---- used by the GUI (main thread) ----
+  bool isInstrument() const { return instrument_; }
+  HostedPlugin* hosted() const { return slot_ ? slot_->plugin.get() : nullptr; }
+  const PluginRecord& loadedRecord() const { return loaded_; }
+  bool hasMissingPlugin() const { return !missingState_.empty(); }
+  const std::string& missingDescription() const { return missingText_; }
+
+  bool loadVst(const PluginRecord& rec, bool sandboxed, std::string& error);
+  void unloadVst();
+  // After a crash: start a fresh instance and restore the last known good state.
+  bool reload(std::string& error);
+  void setProgram(int32_t index);
+  void editParameter(uint32_t index, double value);  // from the generic editor
+  void beginParameterEdit(uint32_t index);
+  void endParameterEdit(uint32_t index);
+  const std::vector<std::string>& paramNames() const { return paramNames_; }
+  bool genericView() const { return genericView_; }
+  void setGenericView(bool g) { genericView_ = g; }
+  void requestResize(uint32_t w, uint32_t h);
+  const clap_host_t* host() const { return host_; }
+  bool isMainThread() const;
+
+  // ---- HostedPlugin::Listener (from the VST2 plugin, any thread) ----
+  void vstAutomate(int32_t index, float value) override;
+  void vstBeginEdit(int32_t index) override;
+  void vstEndEdit(int32_t index) override;
+  bool vstSizeWindow(int32_t width, int32_t height) override;
+  void vstIOChanged() override;
+  void vstUpdateDisplay() override;
+
+ private:
+  struct Slot {
+    std::unique_ptr<HostedPlugin> plugin;
+    std::vector<std::vector<float>> in, out;
+    std::vector<float*> inPtr, outPtr;
+    void allocate(uint32_t frames);
+  };
+  struct OutEvent {
+    enum Kind : uint8_t { Value, Begin, End } kind;
+    uint32_t index;
+    double value;
+  };
+
+  // CLAP plugin
+  bool init();
+  void destroy();
+  bool activate(double sr, uint32_t minFrames, uint32_t maxFrames);
+  void deactivate();
+  bool startProcessing();
+  void stopProcessing();
+  void reset();
+  clap_process_status process(const clap_process_t* p);
+  const void* getExtension(const char* id);
+  void onMainThread();
+
+  // Extensions
+  uint32_t paramsCount();
+  bool paramsInfo(uint32_t index, clap_param_info_t* info);
+  bool paramsValue(clap_id id, double* value);
+  bool paramsValueToText(clap_id id, double value, char* out, uint32_t size);
+  bool paramsTextToValue(clap_id id, const char* text, double* value);
+  void paramsFlush(const clap_input_events_t* in, const clap_output_events_t* out);
+  bool stateSave(const clap_ostream_t* stream);
+  bool stateLoad(const clap_istream_t* stream);
+  uint32_t latency();
+
+  // Helpers
+  void handleInputEvents(const clap_input_events_t* in, Slot* slot, uint32_t frames);
+  void emitOutputEvents(const clap_output_events_t* out);
+  void queueOut(OutEvent e);
+  void rebuildParamNames();
+  void notifyParamsChanged(bool full);
+  std::string buildStateJson();
+  bool applyStateJson(const std::string& json, std::string& error);
+  void installSlot(std::unique_ptr<Slot> s);  // swaps under the process lock; old one destroyed here
+  void updateTime(const clap_event_transport_t* t, uint32_t frames);
+
+  const clap_host_t* host_;
+  const clap_host_params_t* hostParams_ = nullptr;
+  const clap_host_latency_t* hostLatency_ = nullptr;
+  const clap_host_state_t* hostState_ = nullptr;
+  const clap_host_gui_t* hostGui_ = nullptr;
+  const clap_host_thread_check_t* hostThreadCheck_ = nullptr;
+  bool instrument_;
+  bool wrappedAsVst3_ = false;
+  uint32_t mainThreadId_ = 0;
+  clap_plugin_t plugin_;
+
+  double sampleRate_ = 44100;
+  uint32_t maxFrames_ = 1024;
+  bool active_ = false;
+
+  std::mutex procLock_;  // audio thread try_locks; main thread locks to swap the slot
+  std::unique_ptr<Slot> slot_;
+  PluginRecord loaded_;
+  bool loadedSandboxed_ = false;
+  std::string lastGoodState_;  // JSON, for reload after a crash
+  std::string missingState_;   // state of a plugin we could not find, kept verbatim
+  std::string missingText_;
+  std::vector<std::string> paramNames_;
+  bool genericView_ = false;
+
+  // MIDI events for the current block
+  std::vector<uint8_t> eventStore_;
+  std::vector<vst2::VstMidiEvent> midiEvents_;
+  std::vector<vst2::VstMidiSysexEvent> sysexEvents_;
+  std::vector<std::vector<char>> sysexData_;
+  vst2::VstTimeInfo time_{};
+  bool wasPlaying_ = false;
+  double samplePosCounter_ = 0;
+
+  std::mutex outLock_;
+  std::vector<OutEvent> outQueue_;
+
+  std::atomic<bool> pendingCrash_{false}, pendingIO_{false}, pendingDisplay_{false};
+  std::atomic<uint32_t> pendingSize_{0};
+  bool crashReported_ = false;
+
+  std::unique_ptr<Gui> gui_;
+  friend class Gui;
+  friend struct PluginGlue;
+};
+
+}  // namespace yov
