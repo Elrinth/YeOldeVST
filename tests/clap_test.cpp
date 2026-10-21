@@ -342,6 +342,15 @@ int main(int, char**) {
     std::string state = std::string("{\"format\":\"YeOldeVST\",\"version\":1,\"path\":\"") + jsonEscape(argv[4]) +
                         "\",\"shellId\":0}";
     Instance a = create(f, id);
+    {
+      // What a host that reads the list only once (right after creating us) gets.
+      uint32_t n0 = a.params->count(a.p);
+      int vis0 = 0;
+      clap_param_info_t i0;
+      for (uint32_t i = 0; i < n0; ++i)
+        if (a.params->get_info(a.p, i, &i0) && !(i0.flags & CLAP_PARAM_IS_HIDDEN)) ++vis0;
+      printf("before loading a VST: %d visible params\n", vis0);
+    }
     loadState(a, state);
     uint32_t n = a.params->count(a.p);
     int visible = 0;
@@ -361,6 +370,31 @@ int main(int, char**) {
       a.params->get_value(a.p, 0, &v);
       a.params->value_to_text(a.p, 0, v, txt, sizeof txt);
       printf("param 0 = %.3f -> '%s'\n", v, txt);
+    }
+    if (visible > 3) {
+      // Automate slot 3 the way a host does (an event through params.flush) and read it back.
+      struct One {
+        clap_event_param_value_t ev;
+      } one{};
+      one.ev.header = {sizeof one.ev, 0, CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_PARAM_VALUE, 0};
+      one.ev.param_id = 3;
+      one.ev.note_id = -1;
+      one.ev.port_index = -1;
+      one.ev.channel = -1;
+      one.ev.key = -1;
+      one.ev.value = 0.75;
+      clap_input_events_t in{&one, [](const clap_input_events_t*) -> uint32_t { return 1; },
+                             [](const clap_input_events_t* l, uint32_t) -> const clap_event_header_t* {
+                               return &((One*)l->ctx)->ev.header;
+                             }};
+      clap_output_events_t out{nullptr, outPush};
+      a.params->flush(a.p, &in, &out);
+      Sleep(400);  // a bridged plugin's value cache refreshes a few times a second
+      double v = -1;
+      a.params->get_value(a.p, 3, &v);
+      char txt[64] = {};
+      a.params->value_to_text(a.p, 3, v, txt, sizeof txt);
+      printf("automated param 3 to 0.75 -> plugin reports %.3f ('%s')\n", v, txt);
     }
     std::vector<float> wav;
     float p1 = render(a, instrument, &wav);

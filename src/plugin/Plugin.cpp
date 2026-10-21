@@ -871,6 +871,12 @@ bool Plugin::paramsInfo(uint32_t index, clap_param_info_t* info) {
   if (index < paramNames_.size()) {
     info->flags = CLAP_PARAM_IS_AUTOMATABLE;
     snprintf(info->name, sizeof info->name, "%s", paramNames_[index].c_str());
+  } else if (paramNames_.empty() && index < kGenericParams) {
+    // No plugin yet. Many hosts read the parameter list only once, right after creating us, and
+    // ignore later rescans: give them generic slots that map 1:1 to the plugin's parameters once
+    // one is loaded. Hosts that do rescan get the exact list.
+    info->flags = CLAP_PARAM_IS_AUTOMATABLE;
+    snprintf(info->name, sizeof info->name, "Param %u", index + 1);
   } else {
     info->flags = CLAP_PARAM_IS_HIDDEN | CLAP_PARAM_IS_READONLY;
     snprintf(info->name, sizeof info->name, "(unused %u)", index + 1);

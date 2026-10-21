@@ -22,6 +22,8 @@ class Gui;
 
 // Fixed number of parameter slots shown to the DAW. Unused slots are hidden.
 constexpr uint32_t kMaxParams = 1024;
+// Parameter slots shown while no plugin is loaded (for hosts that never re-read the list).
+constexpr uint32_t kGenericParams = 256;
 // Stereo output pairs of the multi-out instrument (Kontakt "16out" style plugins).
 constexpr uint32_t kMultiOutPairs = 16;
 
