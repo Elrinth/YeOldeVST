@@ -23,9 +23,17 @@ namespace {
 
 constexpr int kToolbarH = 40;
 constexpr int kGenericRowH = 26;
-constexpr float kFontSize = 12.5f;  // Segoe UI 9 pt at 96 dpi is 12 px; Linux sans faces run wider
+#if defined(_WIN32)
+// Segoe UI 9 / 11 / 8 pt at 96 dpi, like the Win32 GUI.
+constexpr float kFontSize = 12.f;
+constexpr float kFontSizeTitle = 14.67f;
+constexpr float kFontSizeSmall = 10.67f;
+#else
+// The common Linux sans faces (DejaVu, Noto) run a little larger.
+constexpr float kFontSize = 12.5f;
 constexpr float kFontSizeTitle = 15.f;
 constexpr float kFontSizeSmall = 10.5f;
+#endif
 
 ImU32 col(uint32_t rgb, float alpha = 1.f) {
   return IM_COL32((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF, (int)(alpha * 255.f));
@@ -51,6 +59,24 @@ std::string findFont(bool bold) {
   for (auto d : noto) c.push_back(std::string(d) + (bold ? "NotoSans-Bold.ttf" : "NotoSans-Regular.ttf"));
   const char* lib[] = {"/usr/share/fonts/truetype/liberation/", "/usr/share/fonts/liberation/"};
   for (auto d : lib) c.push_back(std::string(d) + (bold ? "LiberationSans-Bold.ttf" : "LiberationSans-Regular.ttf"));
+#endif
+  for (auto& p : c)
+    if (fileExists(p)) return p;
+  return {};
+}
+
+// A face with the arrows and bullets (U+25B8 ...) the UI face may lack, merged in as fallback.
+std::string findSymbolFont() {
+  std::vector<std::string> c;
+#if defined(_WIN32)
+  std::string win;
+  if (!getEnv("WINDIR", win)) win = "C:\\Windows";
+  c.push_back(joinPath(joinPath(win, "Fonts"), "seguisym.ttf"));
+#elif defined(__APPLE__)
+  c = {"/System/Library/Fonts/Apple Symbols.ttf"};
+#else
+  for (auto d : {"/usr/share/fonts/truetype/dejavu/", "/usr/share/fonts/TTF/", "/usr/share/fonts/dejavu/"})
+    c.push_back(std::string(d) + "DejaVuSans.ttf");
 #endif
   for (auto& p : c)
     if (fileExists(p)) return p;
@@ -282,10 +308,19 @@ bool ImGuiGui::setParent(const clap_window_t* window) {
   }
   scale_ = win_->scale();
   // Fonts: the system's UI face (sizes are chosen when drawing: dynamic font atlas).
-  std::string reg = findFont(false), bold = findFont(true);
-  font_ = reg.empty() ? io.Fonts->AddFontDefault() : io.Fonts->AddFontFromFileTTF(reg.c_str(), kFontSize);
-  fontBold_ = bold.empty() ? font_ : io.Fonts->AddFontFromFileTTF(bold.c_str(), kFontSize);
+  std::string reg = findFont(false), bold = findFont(true), sym = findSymbolFont();
+  auto addFace = [&](const std::string& path) -> ImFont* {
+    ImFont* f = path.empty() ? nullptr : io.Fonts->AddFontFromFileTTF(path.c_str(), kFontSize);
+    if (f && !sym.empty() && sym != path) {
+      ImFontConfig merge;
+      merge.MergeMode = true;
+      io.Fonts->AddFontFromFileTTF(sym.c_str(), kFontSize, &merge);
+    }
+    return f;
+  };
+  font_ = addFace(reg);
   if (!font_) font_ = io.Fonts->AddFontDefault();
+  fontBold_ = addFace(bold);
   if (!fontBold_) fontBold_ = font_;
   setupStyle();
   if (win_->beginGl((int)width_, (int)height_, palette::kBg)) {
