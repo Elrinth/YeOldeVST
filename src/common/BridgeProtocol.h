@@ -18,7 +18,7 @@
 namespace yov::bridge {
 
 constexpr uint32_t kMagic = 0x594F5642;  // 'YOVB'
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2;
 
 constexpr uint32_t kCtrlDataSize = 1u << 20;  // larger payloads travel in a separate mapping
 constexpr uint32_t kMaxChannels = 64;         // per direction
@@ -116,6 +116,12 @@ struct Audio {
   SysexRef sysex[kMaxSysex];
   uint8_t sysexData[kSysexBytes];
   TimeInfo time;
+  // MIDI the plugin sent out during this block (bridge -> client)
+  int32_t numOutMidi;
+  MidiEvent outMidi[kMaxMidi];
+  int32_t numOutSysex;
+  SysexRef outSysex[kMaxSysex];
+  uint8_t outSysexData[kSysexBytes];
   float in[kMaxChannels][kMaxFrames];
   float out[kMaxChannels][kMaxFrames];
 };

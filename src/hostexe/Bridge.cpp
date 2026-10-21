@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -64,6 +65,28 @@ class Server final : public Vst2Plugin::Listener {
   }
   void vstIOChanged() override { push({NIOChanged, 0, 0, 0, 0}); }
   void vstUpdateDisplay() override { push({NUpdateDisplay, 0, 0, 0, 0}); }
+  // MIDI from the plugin can come from any thread: collect it, the audio thread hands it over
+  // with the next finished block.
+  void vstMidiOut(const vst2::VstEvents* e) override {
+    if (!e) return;
+    std::lock_guard<std::mutex> lk(midiOutM_);
+    for (int32_t i = 0; i < e->numEvents; ++i) {
+      const vst2::VstEvent* ev = e->events[i];
+      if (!ev) continue;
+      if (ev->type == vst2::kVstMidiType && midiOut_.size() < kMaxMidi) {
+        auto m = reinterpret_cast<const vst2::VstMidiEvent*>(ev);
+        MidiEvent o{};
+        o.deltaFrames = std::max(0, m->deltaFrames);
+        memcpy(o.bytes, m->midiData, 4);
+        midiOut_.push_back(o);
+      } else if (ev->type == vst2::kVstSysExType && sysexOut_.size() < kMaxSysex) {
+        auto x = reinterpret_cast<const vst2::VstMidiSysexEvent*>(ev);
+        if (!x->sysexDump || x->dumpBytes <= 0 || x->dumpBytes > (int32_t)kSysexBytes) continue;
+        sysexOut_.push_back({std::max(0, x->deltaFrames),
+                             std::vector<uint8_t>((uint8_t*)x->sysexDump, (uint8_t*)x->sysexDump + x->dumpBytes)});
+      }
+    }
+  }
 
  private:
   void push(const Notify& n) {
@@ -163,6 +186,9 @@ class Server final : public Vst2Plugin::Listener {
   HWND container_ = nullptr;
   std::wstring containerClass_;
   std::atomic<bool> quit_{false};
+  std::mutex midiOutM_;
+  std::vector<MidiEvent> midiOut_;
+  std::vector<std::pair<int32_t, std::vector<uint8_t>>> sysexOut_;
 };
 
 void Server::handleCtrl() {
@@ -414,6 +440,22 @@ void Server::audioLoop() {
       if (evs->numEvents) plug_->processEvents(evs);
       a.ok = plug_->process(inPtr, outPtr, a.frames) ? 1 : 0;
       checkDead();
+    }
+    {
+      // Hand over MIDI the plugin sent since the last block.
+      std::lock_guard<std::mutex> lk(midiOutM_);
+      a.numOutMidi = (int32_t)std::min<size_t>(midiOut_.size(), kMaxMidi);
+      for (int32_t i = 0; i < a.numOutMidi; ++i) a.outMidi[i] = midiOut_[i];
+      a.numOutSysex = 0;
+      uint32_t used = 0;
+      for (auto& [delta, data] : sysexOut_) {
+        if (a.numOutSysex >= (int32_t)kMaxSysex || used + data.size() > kSysexBytes) break;
+        memcpy(a.outSysexData + used, data.data(), data.size());
+        a.outSysex[a.numOutSysex++] = {delta, used, (uint32_t)data.size()};
+        used += (uint32_t)data.size();
+      }
+      midiOut_.clear();
+      sysexOut_.clear();
     }
     MemoryBarrier();
     a.doneSeq = seq;

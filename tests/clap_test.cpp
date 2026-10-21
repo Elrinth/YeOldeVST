@@ -77,7 +77,16 @@ static uint32_t evSize(const clap_input_events_t* l) { return (uint32_t)((EventL
 static const clap_event_header_t* evGet(const clap_input_events_t* l, uint32_t i) {
   return &((EventList*)l->ctx)->notes[i].header;
 }
-static bool outPush(const clap_output_events_t*, const clap_event_header_t*) { return true; }
+static int gMidiOut = 0;
+static int gMidiOutFirstKey = -1;
+static bool outPush(const clap_output_events_t*, const clap_event_header_t* h) {
+  if (h->space_id == CLAP_CORE_EVENT_SPACE_ID && h->type == CLAP_EVENT_MIDI) {
+    auto m = reinterpret_cast<const clap_event_midi_t*>(h);
+    if (gMidiOutFirstKey < 0) gMidiOutFirstKey = m->data[1];
+    ++gMidiOut;
+  }
+  return true;
+}
 
 static std::string jsonEscape(const std::string& s) {
   std::string o;
@@ -93,6 +102,7 @@ struct Instance {
   const clap_plugin_state_t* state = nullptr;
   const clap_plugin_params_t* params = nullptr;
   const clap_plugin_gui_t* gui = nullptr;
+  const clap_plugin_audio_ports_t* ports = nullptr;
 };
 
 static Instance create(const clap_plugin_factory_t* f, const char* id) {
@@ -105,6 +115,7 @@ static Instance create(const clap_plugin_factory_t* f, const char* id) {
   in.state = (const clap_plugin_state_t*)in.p->get_extension(in.p, CLAP_EXT_STATE);
   in.params = (const clap_plugin_params_t*)in.p->get_extension(in.p, CLAP_EXT_PARAMS);
   in.gui = (const clap_plugin_gui_t*)in.p->get_extension(in.p, CLAP_EXT_GUI);
+  in.ports = (const clap_plugin_audio_ports_t*)in.p->get_extension(in.p, CLAP_EXT_AUDIO_PORTS);
   return in;
 }
 
@@ -133,11 +144,20 @@ static float render(Instance& in, bool instrument, std::vector<float>* wav) {
   const uint32_t block = 256;
   in.p->activate(in.p, sr, 32, block);
   in.p->start_processing(in.p);
-  std::vector<float> inL(block), inR(block), outL(block), outR(block);
+  std::vector<float> inL(block), inR(block);
   float* inPtr[2] = {inL.data(), inR.data()};
-  float* outPtr[2] = {outL.data(), outR.data()};
   clap_audio_buffer_t ain{inPtr, nullptr, 2, 0, 0};
-  clap_audio_buffer_t aout{outPtr, nullptr, 2, 0, 0};
+  uint32_t nports = in.ports ? in.ports->count(in.p, false) : 1;
+  std::vector<std::vector<float>> outBufs(nports * 2, std::vector<float>(block));
+  std::vector<float*> outPtrs;
+  for (auto& b : outBufs) outPtrs.push_back(b.data());
+  std::vector<clap_audio_buffer_t> aouts(nports);
+  for (uint32_t i = 0; i < nports; ++i) aouts[i] = {&outPtrs[i * 2], nullptr, 2, 0, 0};
+  std::vector<float> portPeak(nports, 0.f);
+  float* outL = outPtrs[0];
+  float* outR = outPtrs[1];
+  gMidiOut = 0;
+  gMidiOutFirstKey = -1;
   EventList evs;
   clap_input_events_t inEv{&evs, evSize, evGet};
   clap_output_events_t outEv{nullptr, outPush};
@@ -185,11 +205,15 @@ static float render(Instance& in, bool instrument, std::vector<float>* wav) {
     pr.transport = &tr;
     pr.audio_inputs = instrument ? nullptr : &ain;
     pr.audio_inputs_count = instrument ? 0 : 1;
-    pr.audio_outputs = &aout;
-    pr.audio_outputs_count = 1;
+    pr.audio_outputs = aouts.data();
+    pr.audio_outputs_count = nports;
     pr.in_events = &inEv;
     pr.out_events = &outEv;
     in.p->process(in.p, &pr);
+    for (uint32_t port = 0; port < nports; ++port)
+      for (uint32_t i = 0; i < block; ++i)
+        if (b > 2)
+          portPeak[port] = std::max(portPeak[port], std::max(std::fabs(outBufs[port * 2][i]), std::fabs(outBufs[port * 2 + 1][i])));
     for (uint32_t i = 0; i < block; ++i) {
       if (b > 2) peak = std::max(peak, std::max(std::fabs(outL[i]), std::fabs(outR[i])));
       if (wav) {
@@ -201,6 +225,12 @@ static float render(Instance& in, bool instrument, std::vector<float>* wav) {
   }
   in.p->stop_processing(in.p);
   in.p->deactivate(in.p);
+  if (nports > 1) {
+    printf("ports: %u, peaks:", nports);
+    for (float pp : portPeak) printf(" %.2f", pp);
+    printf("\n");
+  }
+  printf("midi out events: %d (first key %d)\n", gMidiOut, gMidiOutFirstKey);
   return peak;
 }
 
@@ -279,8 +309,11 @@ int main(int argc, char** argv) {
   entry->init(argv[1]);
   auto f = (const clap_plugin_factory_t*)entry->get_factory(CLAP_PLUGIN_FACTORY_ID);
   std::string mode = argv[2];
-  bool instrument = std::string(argv[3]) == "instrument";
-  const char* id = instrument ? "com.thefirstboss.yeoldevst.instrument" : "com.thefirstboss.yeoldevst.effect";
+  std::string flavour = argv[3];
+  bool instrument = flavour != "effect";
+  const char* id = flavour == "multi"      ? "com.thefirstboss.yeoldevst.instrument.multiout"
+                   : flavour == "instrument" ? "com.thefirstboss.yeoldevst.instrument"
+                                             : "com.thefirstboss.yeoldevst.effect";
   printf("factory has %u plugins\n", f->get_plugin_count(f));
 
   if (mode == "render" && argc >= 5) {

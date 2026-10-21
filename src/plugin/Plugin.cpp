@@ -59,8 +59,25 @@ static const clap_plugin_descriptor_t kEffectDesc = {
     kEffectFeatures,
 };
 
-const clap_plugin_descriptor_t* Plugin::descriptor(bool instrument) {
-  return instrument ? &kInstrumentDesc : &kEffectDesc;
+static const clap_plugin_descriptor_t kInstrumentMultiDesc = {
+    CLAP_VERSION_INIT,
+    "com.thefirstboss.yeoldevst.instrument.multiout",
+    "YeOldeVST Instrument (multi-out)",
+    "Elrinth",
+    "https://forgejo.thefirstboss.com/elrinth/YeOldeVST",
+    "",
+    "",
+    kVersion,
+    "Hosts old VST 1.x/2.x instruments with up to 16 stereo outputs (32-bit and 64-bit)",
+    kInstrumentFeatures,
+};
+
+const clap_plugin_descriptor_t* Plugin::descriptor(Flavour flavour) {
+  switch (flavour) {
+    case Flavour::Effect: return &kEffectDesc;
+    case Flavour::InstrumentMulti: return &kInstrumentMultiDesc;
+    default: return &kInstrumentDesc;
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -84,13 +101,19 @@ struct PluginGlue {
 
   // audio ports
   static uint32_t audioPortsCount(const clap_plugin_t* p, bool isInput) {
-    return isInput ? (self(p)->instrument_ ? 0 : 1) : 1;
+    return isInput ? (self(p)->instrument_ ? 0 : 1) : self(p)->outPairs_;
   }
   static bool audioPortsGet(const clap_plugin_t* p, uint32_t index, bool isInput, clap_audio_port_info_t* info) {
-    if (index != 0 || (isInput && self(p)->instrument_)) return false;
-    info->id = 0;
-    snprintf(info->name, sizeof info->name, "%s", isInput ? "Input" : "Output");
-    info->flags = CLAP_AUDIO_PORT_IS_MAIN;
+    if (isInput && (index != 0 || self(p)->instrument_)) return false;
+    if (!isInput && index >= self(p)->outPairs_) return false;
+    info->id = index;
+    if (isInput)
+      snprintf(info->name, sizeof info->name, "Input");
+    else if (self(p)->outPairs_ == 1)
+      snprintf(info->name, sizeof info->name, "Output");
+    else
+      snprintf(info->name, sizeof info->name, "Out %u/%u", index * 2 + 1, index * 2 + 2);
+    info->flags = index == 0 ? CLAP_AUDIO_PORT_IS_MAIN : 0;
     info->channel_count = 2;
     info->port_type = CLAP_PORT_STEREO;
     info->in_place_pair = CLAP_INVALID_ID;
@@ -99,13 +122,20 @@ struct PluginGlue {
   static constexpr clap_plugin_audio_ports_t audioPorts{audioPortsCount, audioPortsGet};
 
   // note ports
-  static uint32_t notePortsCount(const clap_plugin_t*, bool isInput) { return isInput ? 1 : 0; }
+  // One MIDI input, and one MIDI output for what the hosted plugin sends (arpeggiators etc.).
+  static uint32_t notePortsCount(const clap_plugin_t*, bool) { return 1; }
   static bool notePortsGet(const clap_plugin_t*, uint32_t index, bool isInput, clap_note_port_info_t* info) {
-    if (!isInput || index != 0) return false;
+    if (index != 0) return false;
     info->id = 0;
-    info->supported_dialects = CLAP_NOTE_DIALECT_CLAP | CLAP_NOTE_DIALECT_MIDI;
-    info->preferred_dialect = CLAP_NOTE_DIALECT_MIDI;
-    snprintf(info->name, sizeof info->name, "MIDI In");
+    if (isInput) {
+      info->supported_dialects = CLAP_NOTE_DIALECT_CLAP | CLAP_NOTE_DIALECT_MIDI;
+      info->preferred_dialect = CLAP_NOTE_DIALECT_MIDI;
+      snprintf(info->name, sizeof info->name, "MIDI In");
+    } else {
+      info->supported_dialects = CLAP_NOTE_DIALECT_MIDI;
+      info->preferred_dialect = CLAP_NOTE_DIALECT_MIDI;
+      snprintf(info->name, sizeof info->name, "MIDI Out");
+    }
     return true;
   }
   static constexpr clap_plugin_note_ports_t notePorts{notePortsCount, notePortsGet};
@@ -210,8 +240,10 @@ struct PluginGlue {
 
 // ---------------------------------------------------------------------------------------------
 
-Plugin::Plugin(const clap_host_t* host, bool instrument) : host_(host), instrument_(instrument) {
-  plugin_.desc = descriptor(instrument);
+Plugin::Plugin(const clap_host_t* host, Flavour flavour)
+    : host_(host), instrument_(flavour != Flavour::Effect) {
+  outPairs_ = flavour == Flavour::InstrumentMulti ? kMultiOutPairs : 1;
+  plugin_.desc = descriptor(flavour);
   plugin_.plugin_data = this;
   plugin_.init = PluginGlue::init;
   plugin_.destroy = PluginGlue::destroy;
@@ -225,6 +257,8 @@ Plugin::Plugin(const clap_host_t* host, bool instrument) : host_(host), instrume
   plugin_.on_main_thread = PluginGlue::onMainThread;
 
   midiEvents_.resize(1024);
+  midiOut_.reserve(2048);
+  midiOutBlock_.reserve(2048);
   sysexEvents_.resize(64);
   sysexData_.resize(64);
   eventStore_.resize(sizeof(VstEvents) + sizeof(VstEvent*) * (midiEvents_.size() + sysexEvents_.size()));
@@ -693,6 +727,12 @@ clap_process_status Plugin::process(const clap_process_t* p) {
     }
   };
 
+  // Extra stereo pairs (multi-out flavour) start silent; filled below from the plugin's
+  // outputs 3/4, 5/6, ...
+  for (uint32_t port = 1; port < p->audio_outputs_count; ++port)
+    for (uint32_t ch = 0; ch < p->audio_outputs[port].channel_count; ++ch)
+      std::memset(p->audio_outputs[port].data32[ch], 0, frames * sizeof(float));
+
   std::unique_lock<std::mutex> lk(procLock_, std::try_to_lock);
   if (!lk.owns_lock()) {
     // A plugin is being swapped on the main thread right now.
@@ -726,6 +766,12 @@ clap_process_status Plugin::process(const clap_process_t* p) {
     if (ok && info.numOutputs > 0) {
       if (outL) std::memcpy(outL, slot->out[0].data(), frames * sizeof(float));
       if (outR) std::memcpy(outR, slot->out[info.numOutputs > 1 ? 1 : 0].data(), frames * sizeof(float));
+      for (uint32_t port = 1; port < p->audio_outputs_count; ++port)
+        for (uint32_t ch = 0; ch < p->audio_outputs[port].channel_count && ch < 2; ++ch) {
+          int src = (int)(port * 2 + ch);
+          if (src < info.numOutputs && src < (int)slot->out.size())
+            std::memcpy(p->audio_outputs[port].data32[ch], slot->out[src].data(), frames * sizeof(float));
+        }
     } else if (ok) {
       passThroughOrSilence();
     }
@@ -750,7 +796,63 @@ clap_process_status Plugin::process(const clap_process_t* p) {
   }
   lk.unlock();
   emitOutputEvents(p->out_events);
+  emitMidiOut(p->out_events, frames);
   return CLAP_PROCESS_CONTINUE;
+}
+
+void Plugin::vstMidiOut(const VstEvents* events) {
+  if (!events) return;
+  std::lock_guard<std::mutex> lk(midiOutLock_);
+  for (int32_t i = 0; i < events->numEvents && midiOut_.size() < 2048; ++i) {
+    const VstEvent* e = events->events[i];
+    if (!e) continue;
+    if (e->type == kVstMidiType) {
+      auto m = reinterpret_cast<const VstMidiEvent*>(e);
+      MidiOut o{(uint32_t)std::max(0, m->deltaFrames), {(uint8_t)m->midiData[0], (uint8_t)m->midiData[1],
+                                                         (uint8_t)m->midiData[2]}, -1};
+      if (o.bytes[0] & 0x80) midiOut_.push_back(o);
+    } else if (e->type == kVstSysExType && midiOutSysex_.size() < 64) {
+      auto x = reinterpret_cast<const VstMidiSysexEvent*>(e);
+      if (!x->sysexDump || x->dumpBytes <= 0 || x->dumpBytes > (1 << 20)) continue;
+      midiOutSysex_.emplace_back((const uint8_t*)x->sysexDump, (const uint8_t*)x->sysexDump + x->dumpBytes);
+      midiOut_.push_back({(uint32_t)std::max(0, x->deltaFrames), {0, 0, 0}, (int32_t)midiOutSysex_.size() - 1});
+    }
+  }
+}
+
+void Plugin::emitMidiOut(const clap_output_events_t* out, uint32_t frames) {
+  if (!out) return;
+  {
+    std::unique_lock<std::mutex> lk(midiOutLock_, std::try_to_lock);
+    if (!lk.owns_lock()) return;  // the plugin is sending right now: next block
+    midiOutBlock_.clear();
+    midiOutSysexBlock_.clear();
+    midiOut_.swap(midiOutBlock_);
+    midiOutSysex_.swap(midiOutSysexBlock_);
+  }
+  if (midiOutBlock_.empty()) return;
+  // Output events must be in time order.
+  std::stable_sort(midiOutBlock_.begin(), midiOutBlock_.end(),
+                   [](const MidiOut& a, const MidiOut& b) { return a.time < b.time; });
+  uint32_t last = frames ? frames - 1 : 0;
+  for (auto& m : midiOutBlock_) {
+    uint32_t t = std::min(m.time, last);
+    if (m.sysex < 0) {
+      clap_event_midi_t ev{};
+      ev.header = {sizeof ev, t, CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_MIDI, 0};
+      ev.port_index = 0;
+      memcpy(ev.data, m.bytes, 3);
+      out->try_push(out, &ev.header);
+    } else {
+      auto& d = midiOutSysexBlock_[(size_t)m.sysex];  // stays alive until the next block
+      clap_event_midi_sysex_t ev{};
+      ev.header = {sizeof ev, t, CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_MIDI_SYSEX, 0};
+      ev.port_index = 0;
+      ev.buffer = d.data();
+      ev.size = (uint32_t)d.size();
+      out->try_push(out, &ev.header);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------------------------

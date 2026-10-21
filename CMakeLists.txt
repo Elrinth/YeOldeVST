@@ -51,6 +51,11 @@ if(MSVC)
   target_link_options(yov_host PRIVATE /STACK:8388608)
 endif()
 
+# Test VST2 plugin (MIDI echo + 6 outputs), built for both architectures.
+add_library(yov_vst2_test MODULE tests/vst2_test_plugin.cpp)
+target_include_directories(yov_vst2_test PRIVATE src)
+set_target_properties(yov_vst2_test PROPERTIES OUTPUT_NAME "YovTest${YOV_BITS}")
+
 if(NOT YOV_BUILD_PLUGIN)
   return()
 endif()
@@ -64,7 +69,7 @@ ExternalProject_Add(yov_host32
   CMAKE_GENERATOR ${CMAKE_GENERATOR}
   CMAKE_GENERATOR_PLATFORM Win32
   CMAKE_ARGS -DYOV_BUILD_PLUGIN=OFF
-  BUILD_COMMAND ${CMAKE_COMMAND} --build ${YOV_HOST32_DIR} --config $<CONFIG> --target yov_host
+  BUILD_COMMAND ${CMAKE_COMMAND} --build ${YOV_HOST32_DIR} --config $<CONFIG> --target yov_host yov_vst2_test
   INSTALL_COMMAND ""
   BUILD_ALWAYS TRUE
 )

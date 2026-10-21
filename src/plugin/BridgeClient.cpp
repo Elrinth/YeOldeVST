@@ -180,6 +180,43 @@ class BridgedPlugin final : public HostedPlugin {
   void notifyLoop();
   void shutdown();
 
+  // MIDI the plugin produced in the block just finished: hand it to the listener as VST events,
+  // the same way an in-process plugin delivers it.
+  void forwardMidiOut(const Audio& a, int32_t offset) {
+    if (!listener_ || (a.numOutMidi <= 0 && a.numOutSysex <= 0)) return;
+    int n = std::min<int>(a.numOutMidi, kMaxMidi), ns = std::min<int>(a.numOutSysex, kMaxSysex);
+    outMidi_.resize(kMaxMidi);
+    outSysex_.resize(kMaxSysex);
+    outEvStore_.resize(sizeof(vst2::VstEvents) + sizeof(void*) * (kMaxMidi + kMaxSysex));
+    auto* evs = reinterpret_cast<vst2::VstEvents*>(outEvStore_.data());
+    evs->numEvents = 0;
+    for (int i = 0; i < n; ++i) {
+      auto& m = outMidi_[i];
+      memset(&m, 0, sizeof m);
+      m.type = vst2::kVstMidiType;
+      m.byteSize = sizeof m;
+      m.deltaFrames = a.outMidi[i].deltaFrames + offset;
+      memcpy(m.midiData, a.outMidi[i].bytes, 4);
+      evs->events[evs->numEvents++] = reinterpret_cast<vst2::VstEvent*>(&m);
+    }
+    for (int i = 0; i < ns; ++i) {
+      auto& r = a.outSysex[i];
+      if (r.offset + r.size > kSysexBytes) continue;
+      auto& x = outSysex_[i];
+      memset(&x, 0, sizeof x);
+      x.type = vst2::kVstSysExType;
+      x.byteSize = sizeof x;
+      x.deltaFrames = r.deltaFrames + offset;
+      x.dumpBytes = (int32_t)r.size;
+      x.sysexDump = (char*)a.outSysexData + r.offset;
+      evs->events[evs->numEvents++] = reinterpret_cast<vst2::VstEvent*>(&x);
+    }
+    if (evs->numEvents) listener_->vstMidiOut(evs);
+  }
+  std::vector<vst2::VstMidiEvent> outMidi_;
+  std::vector<vst2::VstMidiSysexEvent> outSysex_;
+  std::vector<uint8_t> outEvStore_;
+
   Listener* listener_;
   DWORD mainThread_ = 0;
   std::string base_;
@@ -469,6 +506,7 @@ bool BridgedPlugin::process(float** in, float** out, int32_t frames, const vst2:
       return false;
     }
     MemoryBarrier();
+    forwardMidiOut(a, offset);
     if (!a.ok) return false;
     for (int c = 0; c < nout; ++c) memcpy(out[c] + offset, a.out[c], sizeof(float) * (size_t)n);
     offset += n;

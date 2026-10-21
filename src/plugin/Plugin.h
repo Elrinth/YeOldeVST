@@ -22,6 +22,10 @@ class Gui;
 
 // Fixed number of parameter slots shown to the DAW. Unused slots are hidden.
 constexpr uint32_t kMaxParams = 1024;
+// Stereo output pairs of the multi-out instrument (Kontakt "16out" style plugins).
+constexpr uint32_t kMultiOutPairs = 16;
+
+enum class Flavour { Instrument, Effect, InstrumentMulti };
 
 // One process-wide set of settings / database / scanner shared by every instance.
 struct Shared {
@@ -33,10 +37,10 @@ struct Shared {
 
 class Plugin final : public HostedPlugin::Listener {
  public:
-  Plugin(const clap_host_t* host, bool instrument);
+  Plugin(const clap_host_t* host, Flavour flavour);
   ~Plugin() override;
 
-  static const clap_plugin_descriptor_t* descriptor(bool instrument);
+  static const clap_plugin_descriptor_t* descriptor(Flavour flavour);
   const clap_plugin_t* clapPlugin() const { return &plugin_; }
 
   // ---- used by the GUI (main thread) ----
@@ -68,6 +72,7 @@ class Plugin final : public HostedPlugin::Listener {
   bool vstSizeWindow(int32_t width, int32_t height) override;
   void vstIOChanged() override;
   void vstUpdateDisplay() override;
+  void vstMidiOut(const vst2::VstEvents* events) override;
 
  private:
   struct Slot {
@@ -123,6 +128,7 @@ class Plugin final : public HostedPlugin::Listener {
   const clap_host_gui_t* hostGui_ = nullptr;
   const clap_host_thread_check_t* hostThreadCheck_ = nullptr;
   bool instrument_;
+  uint32_t outPairs_ = 1;
   bool wrappedAsVst3_ = false;
   uint32_t mainThreadId_ = 0;
   clap_plugin_t plugin_;
@@ -153,6 +159,20 @@ class Plugin final : public HostedPlugin::Listener {
 
   std::mutex outLock_;
   std::vector<OutEvent> outQueue_;
+
+  // MIDI the hosted plugin sends out (audioMasterProcessEvents), passed to the host after
+  // process(). Sysex payloads live in midiOutSysex_ until the block is done.
+  struct MidiOut {
+    uint32_t time;
+    uint8_t bytes[3];
+    int32_t sysex;  // index into midiOutSysex_, -1 for short messages
+  };
+  std::mutex midiOutLock_;
+  std::vector<MidiOut> midiOut_;
+  std::vector<std::vector<uint8_t>> midiOutSysex_;
+  std::vector<MidiOut> midiOutBlock_;
+  std::vector<std::vector<uint8_t>> midiOutSysexBlock_;
+  void emitMidiOut(const clap_output_events_t* out, uint32_t frames);
 
   std::atomic<bool> pendingCrash_{false}, pendingIO_{false}, pendingDisplay_{false};
   std::atomic<uint32_t> pendingSize_{0};
