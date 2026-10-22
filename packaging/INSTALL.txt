@@ -1,0 +1,18 @@
+YeOldeVST @VERSION@ - Windows 64-bit
+
+Install (pick the format your DAW uses, or both):
+
+  CLAP: copy YeOldeVST.clap to
+        %LOCALAPPDATA%\Programs\Common\CLAP   (just you)
+     or C:\Program Files\Common Files\CLAP    (all users)
+
+  VST3: copy the whole YeOldeVST.vst3 folder to
+        %LOCALAPPDATA%\Programs\Common\VST3   (just you)
+     or C:\Program Files\Common Files\VST3    (all users)
+
+Then rescan plugins in your DAW. Add "YeOldeVST Instrument", "YeOldeVST Instrument (multi-out)"
+or "YeOldeVST Effect" to a track, open its window, add the folders with your old VST2 .dll
+plugins and press Scan. Double-click a plugin to load it.
+
+32-bit plugins work too: they run in a helper process automatically.
+See README.md for details.

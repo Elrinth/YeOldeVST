@@ -1,0 +1,160 @@
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 60
+    permissions:
+      contents: write # for attaching the zip to a draft release on v* tags
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v5
+
+      # Only the submodules the build needs; vst3sdk's vstgui4, doc and tutorials are skipped.
+      - name: Fetch submodules
+        run: |
+          git submodule update --init --depth 1 external/clap external/clap-wrapper external/vst3sdk
+          git -C external/vst3sdk submodule update --init --depth 1 base pluginterfaces public.sdk cmake
+
+      - name: Read version
+        id: version
+        run: |
+          $m = Select-String -Path CMakeLists.txt -Pattern 'project\(YeOldeVST VERSION ([0-9.]+)'
+          if (-not $m) { throw "no version in CMakeLists.txt" }
+          $v = $m.Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$v") {
+            throw "tag $env:GITHUB_REF_NAME does not match CMakeLists.txt version $v"
+          }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          Write-Host "YeOldeVST $v"
+
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test (headless CLAP host)
+        timeout-minutes: 10
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false # exit codes are checked below
+          # The VST2 path ends up in a state blob, so it must be absolute.
+          $bin = Resolve-Path build/Release
+          $bin32 = Resolve-Path build/host32/Release
+          $test = "$bin/yov_clap_test.exe"
+          $clap = "$bin/YeOldeVST.clap"
+          $cases = @(
+            @{ name = "instrument, 64-bit VST2";            args = @("render", "instrument", "$bin/YovTest64.dll") },
+            @{ name = "instrument, 32-bit VST2 via bridge"; args = @("render", "instrument", "$bin32/YovTest32.dll") },
+            @{ name = "multi-out, 64-bit VST2";             args = @("render", "multi", "$bin/YovTest64.dll") }
+          )
+          $failed = 0
+          foreach ($c in $cases) {
+            Write-Host "::group::$($c.name)"
+            $out = & $test $clap @($c.args) | Out-String
+            $code = $LASTEXITCODE
+            Write-Host $out
+            Write-Host "::endgroup::"
+            $pass = $code -eq 0 -and $out -match '(?m)^PASS\s*$'
+            Write-Host ("{0}: {1}" -f $c.name, $(if ($pass) { "PASS" } else { "FAIL (exit $code)" }))
+            "| $($c.name) | $(if ($pass) { 'PASS' } else { 'FAIL' }) |" | Out-File $env:TEMP/results.md -Append
+            if (-not $pass) { $failed++ }
+          }
+          "### Headless CLAP host`n`n| Case | Result |`n|---|---|" >> $env:GITHUB_STEP_SUMMARY
+          Get-Content $env:TEMP/results.md >> $env:GITHUB_STEP_SUMMARY
+          if ($failed) { throw "$failed test case(s) failed" }
+
+      - name: Build Steinberg VST3 validator
+        run: |
+          cmake -S external/vst3sdk -B build-vst3sdk -G "Visual Studio 17 2022" -A x64 `
+            -DSMTG_ENABLE_VSTGUI_SUPPORT=OFF -DSMTG_ENABLE_VST3_PLUGIN_EXAMPLES=OFF
+          cmake --build build-vst3sdk --config Release --target validator
+
+      - name: Validate VST3
+        timeout-minutes: 10
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false # exit codes are checked below
+          $out = & build-vst3sdk/bin/Release/validator.exe build/Release/YeOldeVST.vst3 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $out
+          $result = ($out -split "`n" | Where-Object { $_ -match '^Result:' } | Select-Object -Last 1)
+          "### VST3 validator`n`n$result" >> $env:GITHUB_STEP_SUMMARY
+          if ($code -ne 0 -or $result -notmatch ' 0 tests failed') { throw "VST3 validator failed (exit $code)" }
+
+      - name: Package
+        id: package
+        run: |
+          $v = "${{ steps.version.outputs.version }}"
+          $name = "YeOldeVST-$v"
+          $dir = "dist/$name"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item build/Release/YeOldeVST.clap $dir
+          Copy-Item build/Release/YeOldeVST.vst3 $dir -Recurse
+          Copy-Item README.md, LICENSE, THIRD_PARTY_LICENSES.txt $dir
+          (Get-Content packaging/INSTALL.txt -Raw).Replace('@VERSION@', $v) |
+            Set-Content "$dir/INSTALL.txt" -NoNewline -Encoding ascii
+          $zip = "dist/$name-win64.zip"
+          Compress-Archive -Path $dir -DestinationPath $zip
+          "zip=$zip" >> $env:GITHUB_OUTPUT
+          "name=$name-win64" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/${{ steps.package.outputs.name }}.zip
+          if-no-files-found: error
+
+      - name: Attach to draft release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false # exit codes are checked below
+          $tag = $env:GITHUB_REF_NAME
+          $v = "${{ steps.version.outputs.version }}"
+          $zip = "${{ steps.package.outputs.zip }}"
+          $draft = gh release view $tag --json isDraft -q .isDraft 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            # Never replace the zip of a release that is already published.
+            if ($draft -ne 'true') { throw "release $tag is already published" }
+            gh release upload $tag $zip --clobber
+          } else {
+            gh release create $tag $zip --draft --verify-tag --title "YeOldeVST $v" --notes "YeOldeVST $v for Windows 64-bit."
+          }
+          if ($LASTEXITCODE -ne 0) { throw "gh failed" }
+
+  # macOS: YeOldeVST does not build on macOS yet. Once the port lands, remove `if: false`
+  # (and the WIN32-only check in CMakeLists.txt) to get a universal build.
+  macos:
+    name: macOS universal
+    if: false
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Fetch submodules
+        run: |
+          git submodule update --init --depth 1 external/clap external/clap-wrapper external/vst3sdk
+          git -C external/vst3sdk submodule update --init --depth 1 base pluginterfaces public.sdk cmake
+
+      - name: Configure
+        run: cmake -S . -B build -G Xcode -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      # TODO: package YeOldeVST.clap / YeOldeVST.vst3 bundles as YeOldeVST-<version>-macos.zip,
+      # upload as an artifact and attach to the draft release like the Windows job.
