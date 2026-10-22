@@ -404,7 +404,7 @@ void Server::audioLoop() {
       static_assert(sizeof(TimeInfo) == sizeof(vst2::VstTimeInfo), "time info layout");
       memcpy(&plug_->timeInfo(), &a.time, sizeof(TimeInfo));
       if (evs->numEvents) plug_->processEvents(evs);
-      a.ok = plug_->process(inPtr, outPtr, a.frames) ? 1 : 0;
+      a.ok = plug_->process(inPtr, sh_->info.numInputs, outPtr, sh_->info.numOutputs, a.frames) ? 1 : 0;
       checkDead();
     }
     {

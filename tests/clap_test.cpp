@@ -654,6 +654,73 @@ int main(int argc, char** argv) {
     return 0;
   }
 #else
+  if (mode == "unload-scan") {
+    // Start a scan from the GUI, then destroy the plugin and unload the DLL while it runs.
+    // argv[3]: "deinit" = call entry->deinit() first (a well-behaved host), else just unload.
+    bool callDeinit = std::string(argv[3]).find("deinit") == 0 || std::string(argv[3]) == "noscan-deinit";
+    bool doScan = std::string(argv[3]).rfind("noscan", 0) != 0;
+    bool withGui = std::string(argv[3]).find("nogui") == std::string::npos;
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = wndProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"yovtest";
+    RegisterClassW(&wc);
+    Instance a = create(f, "com.thefirstboss.yeoldevst.instrument");
+    a.gui->create(a.p, CLAP_WINDOW_API_WIN32, false);
+    uint32_t w = 0, h = 0;
+    a.gui->get_size(a.p, &w, &h);
+    HWND top = CreateWindowW(L"yovtest", L"unload test", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 40, 40, (int)w + 16,
+                             (int)h + 40, nullptr, nullptr, wc.hInstance, nullptr);
+    clap_window_t win{CLAP_WINDOW_API_WIN32};
+    win.win32 = top;
+    a.gui->set_parent(a.p, &win);
+    a.gui->show(a.p);
+    MSG msg;
+    auto pump = [&](DWORD ms) {
+      DWORD end = GetTickCount() + ms;
+      while (GetTickCount() < end) {
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+          TranslateMessage(&msg);
+          DispatchMessageW(&msg);
+        }
+        mainThreadPump(a);
+        Sleep(10);
+      }
+    };
+    pump(500);
+    struct Find {
+      HWND found = nullptr;
+      static BOOL CALLBACK cb(HWND hw, LPARAM p) {
+        wchar_t t[64] = {}, c[64] = {};
+        GetWindowTextW(hw, t, 64);
+        GetClassNameW(hw, c, 64);
+        if (!wcscmp(t, L"Scan") && !_wcsicmp(c, L"Button")) {
+          ((Find*)p)->found = hw;
+          return FALSE;
+        }
+        return TRUE;
+      }
+    } finder;
+    EnumChildWindows(top, Find::cb, (LPARAM)&finder);
+    if (!finder.found) {
+      printf("no Scan button found\n");
+      return 4;
+    }
+    if (doScan) SendMessageW(finder.found, BM_CLICK, 0, 0);
+    pump(2500);  // the scan is now busy probing plugins
+    printf("scan started; destroying the plugin and unloading (%s)\n", callDeinit ? "with deinit" : "no deinit");
+    a.gui->destroy(a.p);
+    a.p->destroy(a.p);
+    DestroyWindow(top);
+    if (callDeinit) entry->deinit();
+    FreeLibrary((HMODULE)mod);
+    pump(8000);  // if a scan thread kept running in unloaded code, the process dies here
+    HMODULE still = GetModuleHandleW(wide(argv[1]).c_str());
+    printf("still alive after 8 s; module %s\n", still ? "still loaded (scan finishing)" : "unloaded");
+    printf("PASS\n");
+    return 0;
+  }
+
   if (mode == "gui" && argc >= 5) {
     WNDCLASSW wc{};
     wc.lpfnWndProc = wndProc;

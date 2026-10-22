@@ -40,4 +40,12 @@ void* dynSymbol(void* lib, const char* name) { return (void*)GetProcAddress((HMO
 
 void dynClose(void* lib) { FreeLibrary((HMODULE)lib); }
 
+// Nothing to do on Windows: threads started through the C runtime (std::thread, _beginthreadex)
+// already hold a reference on the module of their start routine and drop it when they exit.
+// Ending the thread here with FreeLibraryAndExitThread would skip that release and keep the
+// module loaded forever.
+void* dynPinSelf() { return nullptr; }
+
+void dynReleaseSelf(void*) {}
+
 }  // namespace yov

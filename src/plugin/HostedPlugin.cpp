@@ -92,7 +92,7 @@ class InProcessPlugin final : public HostedPlugin {
     if (p_->dead()) return false;
     p_->timeInfo() = time;
     if (events && events->numEvents > 0) p_->processEvents(const_cast<VstEvents*>(events));
-    return p_->process(in, out, frames);
+    return p_->process(in, info_.numInputs, out, info_.numOutputs, frames);
   }
 
   bool editorSize(int& w, int& h) override { return p_->editorGetRect(w, h); }

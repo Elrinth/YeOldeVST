@@ -58,10 +58,14 @@ jobs:
           $cases = @(
             @{ name = "instrument, 64-bit VST2";            args = @("render", "instrument", "$bin/YovTest64.dll") },
             @{ name = "instrument, 32-bit VST2 via bridge"; args = @("render", "instrument", "$bin32/YovTest32.dll") },
-            @{ name = "multi-out, 64-bit VST2";             args = @("render", "multi", "$bin/YovTest64.dll") }
+            @{ name = "multi-out, 64-bit VST2";             args = @("render", "multi", "$bin/YovTest64.dll") },
+            # A plugin with far more outputs than YeOldeVST routes must not write past its buffers.
+            @{ name = "128 outputs, 64-bit VST2";           args = @("render", "multi", "$bin/YovTest64.dll"); outputs = "128" },
+            @{ name = "128 outputs, 32-bit VST2 via bridge"; args = @("render", "multi", "$bin32/YovTest32.dll"); outputs = "128" }
           )
           $failed = 0
           foreach ($c in $cases) {
+            $env:YOV_TEST_OUTPUTS = $c.outputs  # read by the test plugin; empty = its default
             Write-Host "::group::$($c.name)"
             $out = & $test $clap @($c.args) | Out-String
             $code = $LASTEXITCODE

@@ -48,4 +48,13 @@ void* dynSymbol(void* lib, const char* name) { return dlsym(lib, name); }
 
 void dynClose(void* lib) { dlclose(lib); }
 
+void* dynPinSelf() {
+  // Mark this library as never unloaded while a background thread may run in it.
+  Dl_info info{};
+  if (!dladdr(reinterpret_cast<void*>(&dynPinSelf), &info) || !info.dli_fname) return nullptr;
+  return dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD | RTLD_NODELETE);
+}
+
+void dynReleaseSelf(void*) {}
+
 }  // namespace yov

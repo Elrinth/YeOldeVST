@@ -79,9 +79,13 @@ class Vst2Plugin {
   void suspend();  // effStopProcess + effMainsChanged(0)
   bool resumed() const { return resumed_; }
 
-  // Audio thread. Buffers must have numInputs() / numOutputs() channels of `frames` samples.
+  // Audio thread. The caller passes as many buffers as it routes (numIn / numOut); any further
+  // channels the plugin declares get scratch buffers (silent inputs, discarded outputs), so a
+  // plugin with more channels than the caller handles never writes past the arrays.
   // Uses processReplacing when available, otherwise the VST 1.x accumulating process().
-  bool process(float** inputs, float** outputs, int32_t frames);
+  bool process(float** inputs, int32_t numIn, float** outputs, int32_t numOut, int32_t frames);
+  // Channel counts we refuse to process (corrupt AEffect): more than this per direction.
+  static constexpr int32_t kChannelLimit = 4096;
   // Audio thread, before process(). The event list must stay valid during process().
   bool processEvents(vst2::VstEvents* events);
   // Audio thread: transport info the plugin reads through audioMasterGetTime.
@@ -130,6 +134,10 @@ class Vst2Plugin {
   std::atomic<uint64_t> audioThreadId_{0};
   vst2::VstTimeInfo time_{};
   std::vector<std::shared_ptr<std::vector<uint8_t>>> chunkKeepAlive_;
+  // process(): full channel pointer arrays and the scratch buffers behind unrouted channels.
+  std::vector<float*> allIn_, allOut_;
+  std::vector<float> silentIn_, trashOut_;
+  void prepareScratch(int32_t frames);
 };
 
 }  // namespace yov

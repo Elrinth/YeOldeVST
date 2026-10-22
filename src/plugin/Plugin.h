@@ -35,6 +35,7 @@ struct Shared {
   PluginDb db;
   Scanner scanner{db};
   static Shared& get();
+  static Shared* existing();  // null if nothing created it yet
 };
 
 class Plugin final : public HostedPlugin::Listener {

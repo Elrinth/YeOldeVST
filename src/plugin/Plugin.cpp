@@ -12,17 +12,22 @@ using namespace vst2;
 
 namespace yov {
 
-static const char* kVersion = "1.1.0";
+static const char* kVersion = "1.2.0";
+
+static std::atomic<Shared*> gShared{nullptr};
 
 Shared& Shared::get() {
   static Shared* s = [] {
     auto* sh = new Shared();  // never destroyed: plugin DLL unload order is up to the host
     sh->settings.load();
     sh->db.load();
+    gShared = sh;
     return sh;
   }();
   return *s;
 }
+
+Shared* Shared::existing() { return gShared.load(); }
 
 // ---------------------------------------------------------------------------------------------
 // Descriptors

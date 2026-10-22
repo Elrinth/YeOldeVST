@@ -140,8 +140,9 @@ int runProbe(const ProbeOptions& opt) {
     p.resume();
   }
   if (!opt.editorOnly) {
-  if (p.numInputs() > 64 || p.numOutputs() > 64 || p.numInputs() < 0 || p.numOutputs() < 0)
-    emit("warn", "reports an odd number of audio channels");
+  if (p.numInputs() > Vst2Plugin::kChannelLimit || p.numOutputs() > Vst2Plugin::kChannelLimit || p.numInputs() < 0 ||
+      p.numOutputs() < 0)
+    emit("warn", "reports an impossible number of audio channels");
   if (p.numOutputs() == 0) emit("warn", "plugin has no audio outputs");
 
   stage("setup");
@@ -200,7 +201,7 @@ int runProbe(const ProbeOptions& opt) {
     p.timeInfo().samplePos = double(b) * block;
     p.timeInfo().ppqPos = p.timeInfo().samplePos / sr * 2.0;
     auto pt = std::chrono::steady_clock::now();
-    p.process(inPtr.data(), outPtr.data(), block);
+    p.process(inPtr.data(), nin, outPtr.data(), nout, block);
     procSec += std::chrono::duration<double>(std::chrono::steady_clock::now() - pt).count();
     if (p.dead()) return faulted(p);
     if (b >= 4) {  // skip warm-up blocks for the stats

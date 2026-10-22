@@ -31,6 +31,12 @@ const clap_plugin_factory_t kFactory = {factoryCount, factoryDescriptor, factory
 
 bool entryInit(const char*) { return true; }
 void entryDeinit() {
+  // The host is about to unload us: stop a scan that is still running (its helper processes
+  // are killed) and wait for its thread, which must not run on in an unloaded module.
+  if (auto* sh = yov::Shared::existing()) {
+    sh->scanner.cancel();
+    sh->scanner.wait();
+  }
   yov::Gui::shutdown();
   yov::sehShutdown();
 }

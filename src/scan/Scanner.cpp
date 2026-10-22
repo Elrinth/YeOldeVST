@@ -1,5 +1,7 @@
 #include "scan/Scanner.h"
 
+#include "platform/DynLib.h"
+
 #include "common/Seh.h"
 #include "common/Util.h"
 #include "platform/Embedded.h"
@@ -477,7 +479,12 @@ bool Scanner::start(const Options& opt) {
     prog_.message = "Looking for plugins...";
   }
   running_ = true;
-  thread_ = std::thread([this, opt] { run(opt); });
+  // The thread keeps this module loaded until it is done (see dynPinSelf).
+  void* pin = dynPinSelf();
+  thread_ = std::thread([this, opt, pin] {
+    run(opt);
+    dynReleaseSelf(pin);
+  });
   return true;
 }
 

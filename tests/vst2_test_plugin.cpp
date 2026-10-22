@@ -10,6 +10,7 @@
 #include "vst2/aeffect.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #if defined(__linux__)
@@ -183,7 +184,9 @@ YOV_EXPORT AEffect* VSTPluginMain(HostCallback host) {
   e.getParameter = getParameter;
   e.processReplacing = processReplacing;
   e.numInputs = 0;
+  // YOV_TEST_OUTPUTS overrides the output count (tests for plugins with very many outputs).
   e.numOutputs = 6;
+  if (const char* n = getenv("YOV_TEST_OUTPUTS")) e.numOutputs = atoi(n) > 0 ? atoi(n) : 6;
   e.numParams = 4;
   e.flags = effFlagsCanReplacing | effFlagsIsSynth;
 #if defined(YOV_TEST_EDITOR)

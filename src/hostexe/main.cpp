@@ -98,7 +98,8 @@ static int cmdRender(const std::string& dll, const std::string& out, int32_t she
   p->setSampleRate(sr);
   p->setBlockSize(block);
   p->resume();
-  int nin = std::max(1, p->numInputs()), nout = std::max(1, p->numOutputs());
+  int nin = std::clamp(p->numInputs(), 1, (int)Vst2Plugin::kChannelLimit);
+  int nout = std::clamp(p->numOutputs(), 1, (int)Vst2Plugin::kChannelLimit);
   std::vector<std::vector<float>> in(nin, std::vector<float>(block)), o(nout, std::vector<float>(block));
   std::vector<float*> ip, op;
   for (auto& b : in) ip.push_back(b.data());
@@ -128,7 +129,7 @@ static int cmdRender(const std::string& dll, const std::string& out, int32_t she
       p->processEvents(&evs);
     }
     p->timeInfo().samplePos = double(b) * block;
-    p->process(ip.data(), op.data(), block);
+    p->process(ip.data(), (int32_t)ip.size(), op.data(), (int32_t)op.size(), block);
     if (p->dead()) {
       fprintf(stderr, "plugin crashed: %s (%s)\n", p->deathReason().c_str(), p->deathStage().c_str());
       return 3;

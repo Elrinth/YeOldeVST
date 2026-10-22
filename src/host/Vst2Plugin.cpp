@@ -3,6 +3,7 @@
 #include "common/Util.h"
 #include "platform/DynLib.h"
 
+#include <algorithm>
 #include <cstring>
 
 #if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
@@ -378,6 +379,7 @@ void Vst2Plugin::setSampleRate(double sr) {
 
 void Vst2Plugin::setBlockSize(int32_t maxFrames) {
   blockSize_ = maxFrames;
+  prepareScratch(maxFrames);
   dispatch(effSetBlockSize, 0, maxFrames);
 }
 
@@ -395,18 +397,37 @@ void Vst2Plugin::suspend() {
   resumed_ = false;
 }
 
-bool Vst2Plugin::process(float** inputs, float** outputs, int32_t frames) {
-  if (!fx_ || dead()) return false;
-  audioThreadId_.store(currentThreadId(), std::memory_order_relaxed);
-  FpuGuard fpu;
+void Vst2Plugin::prepareScratch(int32_t frames) {
+  if (!fx_) return;
+  int32_t nin = std::clamp(fx_->numInputs, 0, kChannelLimit), nout = std::clamp(fx_->numOutputs, 0, kChannelLimit);
+  size_t n = (size_t)std::max(frames, 1);
+  if (allIn_.size() < (size_t)nin) allIn_.resize(nin);
+  if (allOut_.size() < (size_t)nout) allOut_.resize(nout);
+  if (silentIn_.size() < n) silentIn_.assign(n, 0.f);
+  if (trashOut_.size() < n) trashOut_.assign(n, 0.f);
+}
+
+bool Vst2Plugin::process(float** inputs, int32_t numIn, float** outputs, int32_t numOut, int32_t frames) {
+  if (!fx_ || dead() || frames <= 0) return false;
   auto fx = fx_;
+  const int32_t nin = fx->numInputs, nout = fx->numOutputs;
+  if (nin < 0 || nout < 0 || nin > kChannelLimit || nout > kChannelLimit) return false;
+  audioThreadId_.store(currentThreadId(), std::memory_order_relaxed);
+  // Normally sized in setBlockSize / resume; grows here only if a host breaks its block size.
+  prepareScratch(std::max(frames, blockSize_));
+  // Extra inputs must be silent even if the plugin scribbled on them last time.
+  if (nin > numIn) std::memset(silentIn_.data(), 0, sizeof(float) * size_t(frames));
+  for (int32_t c = 0; c < nin; ++c) allIn_[c] = c < numIn ? inputs[c] : silentIn_.data();
+  for (int32_t c = 0; c < nout; ++c) allOut_[c] = c < numOut ? outputs[c] : trashOut_.data();
+  FpuGuard fpu;
   if (canReplacing()) {
-    return guarded("processReplacing", [&] { callProcess(fx->processReplacing, fx, inputs, outputs, frames); });
+    return guarded("processReplacing",
+                   [&] { callProcess(fx->processReplacing, fx, allIn_.data(), allOut_.data(), frames); });
   }
   // VST 1.x: process() adds into the outputs.
-  for (int32_t c = 0; c < fx->numOutputs; ++c) std::memset(outputs[c], 0, sizeof(float) * size_t(frames));
+  for (int32_t c = 0; c < nout; ++c) std::memset(allOut_[c], 0, sizeof(float) * size_t(frames));
   if (!fx->process) return false;
-  return guarded("process", [&] { callProcess(fx->process, fx, inputs, outputs, frames); });
+  return guarded("process", [&] { callProcess(fx->process, fx, allIn_.data(), allOut_.data(), frames); });
 }
 
 bool Vst2Plugin::processEvents(VstEvents* events) {
