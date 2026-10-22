@@ -2,9 +2,9 @@
 
 #include "common/Seh.h"
 #include "common/Util.h"
+#include "platform/Embedded.h"
+#include "platform/Process.h"
 #include "vst2/aeffect.h"
-
-#include <windows.h>
 
 #include <algorithm>
 #include <ctime>
@@ -12,27 +12,12 @@
 
 namespace yov {
 
-// Resource ids of the embedded helper executables (see resources/embed.rc.in).
-constexpr int kResHost64 = 201;
-constexpr int kResHost32 = 202;
-
 namespace {
 
-HMODULE thisModule() {
-  HMODULE mod = nullptr;
-  GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                     reinterpret_cast<LPCWSTR>(&thisModule), &mod);
-  return mod;
-}
-
-std::string extractResource(int id, const char* fileName) {
-  HMODULE mod = thisModule();
-  HRSRC res = FindResourceW(mod, MAKEINTRESOURCEW(id), MAKEINTRESOURCEW(10) /*RT_RCDATA*/);
-  if (!res) return {};
-  HGLOBAL g = LoadResource(mod, res);
-  DWORD size = SizeofResource(mod, res);
-  const void* data = g ? LockResource(g) : nullptr;
-  if (!data || !size) return {};
+std::string extractHelper(bool is32, const char* fileName) {
+  const void* data = nullptr;
+  size_t size = 0;
+  if (!embeddedHelper(is32, data, size)) return {};
   // One folder per build of the plugin, so different versions never overwrite each other's
   // helper while it is running.
   FileStamp st;
@@ -49,75 +34,98 @@ std::string extractResource(int id, const char* fileName) {
   if (!cleaned) {
     cleaned = true;
     auto bin = joinPath(localAppDataDir(), "bin");
-    WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileW(widen(joinPath(bin, "*")).c_str(), &fd);
-    if (h != INVALID_HANDLE_VALUE) {
-      do {
-        std::string name = narrow(fd.cFileName);
-        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || name == "." || name == ".." || name == tag) continue;
-        auto old = joinPath(bin, name);
-        for (const char* f : {"YeOldeVST-Host32.exe", "YeOldeVST-Host64.exe"}) DeleteFileW(widen(joinPath(old, f)).c_str());
-        RemoveDirectoryW(widen(old).c_str());
-      } while (FindNextFileW(h, &fd));
-      FindClose(h);
+    std::vector<DirEntry> list;
+    if (listDir(bin, list)) {
+      for (auto& e : list) {
+        if (!e.isDir || e.name == tag) continue;
+        auto old = joinPath(bin, e.name);
+        for (const char* f : {"YeOldeVST-Host32.exe", "YeOldeVST-Host64.exe", "YeOldeVST-Host32", "YeOldeVST-Host64"})
+          removeFile(joinPath(old, f));
+        removeDir(old);
+      }
     }
   }
-  if (!writeFileAtomic(path, std::string_view((const char*)data, size))) return {};
+  if (!writeFileAtomic(path, std::string_view((const char*)data, size), true)) return {};
   return path;
 }
 
-std::string helperName(PeArch arch) {
-  return arch == PeArch::X86 ? "YeOldeVST-Host32.exe" : "YeOldeVST-Host64.exe";
+std::string helperName(Arch arch) {
+#ifdef _WIN32
+  return arch == Arch::X86 ? "YeOldeVST-Host32.exe" : "YeOldeVST-Host64.exe";
+#else
+  return arch == Arch::X86 ? "YeOldeVST-Host32" : "YeOldeVST-Host64";
+#endif
+}
+
+// Plugin binaries this platform can host: DLLs on Windows, shared objects on Linux, .vst
+// bundles on macOS.
+bool isPluginFile(const std::string& name) {
+#if defined(_WIN32)
+  return endsWithNoCase(name, ".dll");
+#elif defined(__APPLE__)
+  return endsWithNoCase(name, ".vst") || endsWithNoCase(name, ".dylib");
+#else
+  return endsWithNoCase(name, ".so");
+#endif
 }
 
 }  // namespace
 
-std::string helperExePath(PeArch arch) {
-  if (arch != PeArch::X86 && arch != PeArch::X64) return {};
+Arch archFromName(const std::string& name) {
+  if (name == "x86") return Arch::X86;
+  if (name == "x64") return Arch::X64;
+  if (name == "arm64") return Arch::Arm64;
+  return name.empty() ? Arch::Unknown : Arch::Other;
+}
+
+std::string helperExePath(Arch arch) {
+  if (arch != Arch::X86 && arch != nativeArch()) return {};
   static std::mutex m;
   static std::string cache[2];
-  int slot = arch == PeArch::X86 ? 0 : 1;
+  int slot = arch == Arch::X86 ? 0 : 1;
   std::lock_guard<std::mutex> lk(m);
   if (!cache[slot].empty() && fileExists(cache[slot])) return cache[slot];
   auto beside = joinPath(thisModuleDir(), helperName(arch));
   if (fileExists(beside)) return cache[slot] = beside;
-  auto extracted = extractResource(arch == PeArch::X86 ? kResHost32 : kResHost64, helperName(arch).c_str());
+  auto extracted = extractHelper(arch == Arch::X86, helperName(arch).c_str());
   return cache[slot] = extracted;
 }
 
 std::vector<std::string> findPluginFiles(const std::vector<std::string>& folders) {
   std::set<std::string> seen;
   std::vector<std::string> out;
-  std::vector<std::wstring> stack;
+  std::vector<std::string> stack;
   for (auto& f : folders)
-    if (!f.empty()) stack.push_back(widen(f));
+    if (!f.empty()) stack.push_back(f);
   int dirs = 0;
+  std::vector<DirEntry> list;
   while (!stack.empty() && dirs < 100000) {
-    std::wstring dir = stack.back();
+    std::string dir = stack.back();
     stack.pop_back();
     ++dirs;
-    WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileExW((dir + L"\\*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr,
-                                FIND_FIRST_EX_LARGE_FETCH);
-    if (h == INVALID_HANDLE_VALUE) continue;
-    do {
-      std::wstring name = fd.cFileName;
-      if (name == L"." || name == L"..") continue;
-      std::wstring full = dir + L"\\" + name;
-      if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+    if (!listDir(dir, list)) continue;
+    for (auto& e : list) {
+      std::string full = joinPath(dir, e.name);
+      if (e.isDir) {
         // Don't follow junctions/symlinks (loops); skip VST3/CLAP bundles, they are not VST2.
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
-        auto n = narrow(name);
-        if (endsWithNoCase(n, ".vst3") || endsWithNoCase(n, ".clap") || endsWithNoCase(n, ".bundle")) continue;
+        if (e.isLink) continue;
+#ifdef __APPLE__
+        if (endsWithNoCase(e.name, ".vst")) {
+          if (seen.insert(pathKey(full)).second) out.push_back(full);
+          continue;
+        }
+#endif
+        if (endsWithNoCase(e.name, ".vst3") || endsWithNoCase(e.name, ".clap") || endsWithNoCase(e.name, ".bundle"))
+          continue;
+#ifndef _WIN32
+        if (endsWithNoCase(e.name, ".lv2")) continue;  // LV2 bundles hold .so files that are not VST2
+#endif
         stack.push_back(full);
       } else {
-        auto n = narrow(name);
-        if (!endsWithNoCase(n, ".dll")) continue;
-        auto f8 = narrow(full);
-        if (seen.insert(foldCase(f8)).second) out.push_back(f8);
+        if (!isPluginFile(e.name)) continue;
+        if (seen.insert(pathKey(full)).second) out.push_back(full);
       }
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
+    }
   }
   std::sort(out.begin(), out.end(), [](const std::string& a, const std::string& b) {
     return foldCase(a) < foldCase(b);
@@ -135,126 +143,57 @@ struct ProbeOutcome {
   bool started = false;
   bool timedOut = false;
   bool cancelled = false;
-  DWORD exitCode = 0;
   uint32_t ms = 0;
+  std::string exitText;  // how the process ended ("access violation (exit code 0xC0000005)")
   std::string spawnError;
 };
-
-HANDLE scanJob() {
-  static HANDLE job = [] {
-    HANDLE j = CreateJobObjectW(nullptr, nullptr);
-    if (j) {
-      JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
-      // Helpers die with us; and a crashing helper must not show the WER dialog.
-      li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
-      SetInformationJobObject(j, JobObjectExtendedLimitInformation, &li, sizeof li);
-    }
-    return j;
-  }();
-  return job;
-}
-
-const wchar_t* scanDesktopName() {
-  // Keep the desktop alive for the life of the process; children are started on it by name.
-  static HDESK desk = CreateDesktopW(L"YeOldeVST-Scan", nullptr, nullptr, 0, GENERIC_ALL, nullptr);
-  return desk ? L"YeOldeVST-Scan" : nullptr;
-}
 
 enum class Phase { All, NoEditor, EditorOnly };
 
 ProbeOutcome runHelper(const std::string& exe, const std::string& path, int32_t shellId, const Scanner::Options& opt,
                        Phase phase, std::atomic<bool>* cancel, bool forceHidden = false) {
   ProbeOutcome o;
-  std::wstring cmd = L"\"" + widen(exe) + L"\" --probe \"" + widen(path) + L"\"";
-  if (shellId) cmd += L" --shell-id " + std::to_wstring(shellId);
-  if (phase == Phase::All) cmd += L" --editor";
-  if (phase == Phase::EditorOnly) cmd += L" --editor-only";
-
-  SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
-  HANDLE rd = nullptr, wr = nullptr;
-  if (!CreatePipe(&rd, &wr, &sa, 1 << 16)) {
-    o.spawnError = "CreatePipe failed";
-    return o;
+  std::vector<std::string> args = {"--probe", path};
+  if (shellId) {
+    args.push_back("--shell-id");
+    args.push_back(std::to_string(shellId));
   }
-  SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+  if (phase == Phase::All) args.push_back("--editor");
+  if (phase == Phase::EditorOnly) args.push_back("--editor-only");
 
-  // Only the pipe's write end is inherited, even when several probes start at once.
-  SIZE_T attrSize = 0;
-  InitializeProcThreadAttributeList(nullptr, 1, 0, &attrSize);
-  std::vector<uint8_t> attrBuf(attrSize);
-  auto attrs = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrBuf.data());
-  InitializeProcThreadAttributeList(attrs, 1, 0, &attrSize);
-  HANDLE inherit[1] = {wr};
-  UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit, sizeof inherit, nullptr, nullptr);
-
-  STARTUPINFOEXW si{};
-  si.StartupInfo.cb = sizeof si;
-  // No STARTF_USESHOWWINDOW: it would turn the probe's first ShowWindow into a hide, and some
-  // editors hang with an invisible parent. CREATE_NO_WINDOW already suppresses the console.
-  si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-  si.StartupInfo.hStdOutput = wr;
-  si.StartupInfo.hStdError = wr;
-  si.StartupInfo.hStdInput = nullptr;
-  std::wstring desktop;
+  SpawnOptions so;
+  so.cwd = dirOf(path);
+  so.captureOutput = true;
+  so.group = SpawnOptions::Group::Scan;
   // Editors misbehave on a desktop nobody can see, so the editor phase runs on the user's one
   // (its window is placed off-screen).
-  if (opt.hiddenDesktop && (phase != Phase::EditorOnly || forceHidden)) {
-    if (auto d = scanDesktopName()) {
-      desktop = d;
-      si.StartupInfo.lpDesktop = desktop.data();
-    }
-  }
-  PROCESS_INFORMATION pi{};
-  std::wstring dir = widen(dirOf(path));
-  BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE,
-                           CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, nullptr,
-                           dir.empty() ? nullptr : dir.c_str(), &si.StartupInfo, &pi);
-  DeleteProcThreadAttributeList(attrs);
-  CloseHandle(wr);
-  if (!ok) {
-    o.spawnError = "could not start helper (error " + std::to_string(GetLastError()) + ")";
-    CloseHandle(rd);
-    return o;
-  }
-  if (HANDLE job = scanJob()) AssignProcessToJobObject(job, pi.hProcess);
-  ResumeThread(pi.hThread);
-  CloseHandle(pi.hThread);
+  so.hiddenDesktop = opt.hiddenDesktop && (phase != Phase::EditorOnly || forceHidden);
+  ChildProcess proc;
+  if (!proc.start(exe, args, so, o.spawnError)) return o;
   o.started = true;
 
   std::string buf;
-  auto drain = [&] {
-    DWORD avail = 0;
-    while (PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr) && avail > 0) {
-      char tmp[4096];
-      DWORD got = 0;
-      if (!ReadFile(rd, tmp, std::min<DWORD>(avail, sizeof tmp), &got, nullptr) || got == 0) break;
-      buf.append(tmp, got);
-      if (buf.size() > (8u << 20)) buf.erase(0, buf.size() - (1u << 20));  // runaway output
-    }
-  };
-  auto t0 = GetTickCount64();
+  auto t0 = nowMs();
   for (;;) {
-    DWORD w = WaitForSingleObject(pi.hProcess, 25);
-    drain();
-    if (w == WAIT_OBJECT_0) break;
+    bool ended = proc.wait(25);
+    proc.readOutput(buf);
+    if (ended) break;
     if (cancel && cancel->load()) {
-      TerminateProcess(pi.hProcess, 0xC000013A);
-      WaitForSingleObject(pi.hProcess, 2000);
+      proc.kill(0xC000013A);
+      proc.wait(2000);
       o.cancelled = true;
       break;
     }
-    if (GetTickCount64() - t0 > (uint64_t)opt.timeoutMs) {
-      TerminateProcess(pi.hProcess, 0x102 /*WAIT_TIMEOUT*/);
-      WaitForSingleObject(pi.hProcess, 2000);
+    if (nowMs() - t0 > (uint64_t)opt.timeoutMs) {
+      proc.kill(0x102 /*WAIT_TIMEOUT*/);
+      proc.wait(2000);
       o.timedOut = true;
       break;
     }
   }
-  drain();
-  GetExitCodeProcess(pi.hProcess, &o.exitCode);
-  o.ms = (uint32_t)(GetTickCount64() - t0);
-  CloseHandle(pi.hProcess);
-  CloseHandle(rd);
+  proc.readOutput(buf);
+  o.exitText = proc.exitDescription();
+  o.ms = (uint32_t)(nowMs() - t0);
 
   size_t pos = 0;
   while (pos < buf.size()) {
@@ -366,12 +305,7 @@ void classify(PluginRecord& r, const ProbeOutcome& o, std::vector<std::pair<int3
                std::to_string(o.ms / 1000) + " s; maybe a hidden dialog or licence prompt)";
   } else {
     std::string stg = faultStage.empty() ? lastStage : faultStage;
-    std::string why = faultText.empty() ? (std::string(exceptionName(o.exitCode)) + " (exit code 0x" + [&] {
-      char b[16];
-      snprintf(b, sizeof b, "%08lX", o.exitCode);
-      return std::string(b);
-    }() + ")")
-                                        : faultText;
+    std::string why = faultText.empty() ? o.exitText : faultText;
     r.stage = stg;
     // Map the guard's stage names (effEditOpen ...) to probe stages for the message.
     std::string probeStage = lastStage;
@@ -426,7 +360,7 @@ void runEditorPhase(PluginRecord& r, const std::string& exe, const Scanner::Opti
 }  // namespace
 
 bool Scanner::testEditor(PluginRecord& r, const Options& opt, std::atomic<bool>* cancel) {
-  std::string exe = helperExePath(r.arch == "x86" ? PeArch::X86 : PeArch::X64);
+  std::string exe = helperExePath(r.arch == "x86" ? Arch::X86 : nativeArch());
   if (exe.empty()) return false;
   Options o = opt;
   o.testEditors = true;
@@ -441,11 +375,22 @@ std::vector<PluginRecord> Scanner::probeFile(const std::string& path, const Opti
   r.path = path;
   fileStamp(path, r.stamp);
   r.scannedAt = (uint64_t)time(nullptr);
-  PeInfo pe = readPeInfo(path);
+  ModuleInfo pe = readModuleInfo(path);
   r.arch = archName(pe.arch);
-  if (!pe.valid || !pe.isDll) {
+  if (pe.valid && pe.format != nativeFormat()) {
+    r.status = ScanStatus::Unsupported;
+    r.detail = std::string(formatName(pe.format)) + " plugin; this build of YeOldeVST hosts " +
+               formatName(nativeFormat()) + " plugins";
+    out.push_back(r);
+    return out;
+  }
+  if (!pe.valid || !pe.isLibrary) {
     r.status = ScanStatus::NotPlugin;
+#ifdef _WIN32
     r.detail = pe.error.empty() ? "not a DLL" : pe.error;
+#else
+    r.detail = pe.error.empty() ? "not a shared library" : pe.error;
+#endif
     out.push_back(r);
     return out;
   }
@@ -457,7 +402,7 @@ std::vector<PluginRecord> Scanner::probeFile(const std::string& path, const Opti
     out.push_back(r);
     return out;
   }
-  if (pe.arch != PeArch::X64 && pe.arch != PeArch::X86) {
+  if (pe.arch != nativeArch() && pe.arch != Arch::X86) {
     r.status = ScanStatus::Unsupported;
     r.detail = std::string(archName(pe.arch)) + " plugins are not supported";
     out.push_back(r);
@@ -466,8 +411,8 @@ std::vector<PluginRecord> Scanner::probeFile(const std::string& path, const Opti
   std::string exe = helperExePath(pe.arch);
   if (exe.empty()) {
     r.status = ScanStatus::NoHelper;
-    r.detail = pe.arch == PeArch::X86 ? "32-bit plugin, but the 32-bit helper (YeOldeVST-Host32.exe) is missing"
-                                      : "the 64-bit helper (YeOldeVST-Host64.exe) is missing";
+    r.detail = pe.arch == Arch::X86 ? "32-bit plugin, but the 32-bit helper (" + helperName(Arch::X86) + ") is missing"
+                                    : "the 64-bit helper (" + helperName(pe.arch) + ") is missing";
     out.push_back(r);
     return out;
   }
@@ -549,15 +494,24 @@ ScanProgress Scanner::progress() const {
 
 void Scanner::run(Options opt) {
   // One scan at a time across all instances / DAWs on this machine.
-  HANDLE sem = CreateSemaphoreW(nullptr, 1, 1, L"Local\\YeOldeVST-ScanLock");
-  if (sem && WaitForSingleObject(sem, 0) != WAIT_OBJECT_0) {
-    CloseHandle(sem);
+  SystemLock lock;
+  if (!lock.tryAcquire("YeOldeVST-ScanLock")) {
     std::lock_guard<std::mutex> lk(m_);
     prog_.running = false;
     prog_.message = "Another YeOldeVST instance is scanning right now. Try again when it is done.";
     running_ = false;
     return;
   }
+
+  // Without a display there is nothing to open editors on.
+  if (!haveDesktop()) opt.testEditors = false;
+  if (opt.hiddenDesktop) hiddenDesktopAcquire();
+  struct HiddenRelease {
+    bool on;
+    ~HiddenRelease() {
+      if (on) hiddenDesktopRelease();
+    }
+  } hiddenRelease{opt.hiddenDesktop};
 
   db_.reloadIfChanged();
   std::vector<std::string> files = opt.onlyFiles.empty() ? findPluginFiles(opt.folders) : opt.onlyFiles;
@@ -569,7 +523,7 @@ void Scanner::run(Options opt) {
     bool editorOnly;
   };
   std::vector<Job> jobs;
-  bool host32 = !helperExePath(PeArch::X86).empty();
+  bool host32 = !helperExePath(Arch::X86).empty();
   for (auto& f : files) {
     PluginRecord old;
     FileStamp st;
@@ -597,7 +551,7 @@ void Scanner::run(Options opt) {
 
   std::atomic<size_t> next{0};
   std::mutex saveM;
-  uint64_t lastSave = GetTickCount64();
+  uint64_t lastSave = nowMs();
   auto worker = [&] {
     for (;;) {
       if (cancel_.load()) return;
@@ -643,9 +597,9 @@ void Scanner::run(Options opt) {
         }
       }
       std::lock_guard<std::mutex> lk(saveM);
-      if (GetTickCount64() - lastSave > 3000) {
+      if (nowMs() - lastSave > 3000) {
         db_.save();  // keep progress if the DAW dies mid-scan
-        lastSave = GetTickCount64();
+        lastSave = nowMs();
       }
     }
   };
@@ -656,10 +610,7 @@ void Scanner::run(Options opt) {
 
   if (opt.onlyFiles.empty() && !cancel_.load()) db_.prune(opt.folders);
   db_.save();
-  if (sem) {
-    ReleaseSemaphore(sem, 1, nullptr);
-    CloseHandle(sem);
-  }
+  lock.release();
   {
     std::lock_guard<std::mutex> lk(m_);
     prog_.running = false;

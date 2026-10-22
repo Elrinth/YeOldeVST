@@ -24,7 +24,7 @@ std::string PluginRecord::displayName() const {
   return dot == std::string::npos ? f : f.substr(0, dot);
 }
 
-std::string PluginRecord::key() const { return foldCase(path) + "|" + std::to_string(shellId); }
+std::string PluginRecord::key() const { return pathKey(path) + "|" + std::to_string(shellId); }
 
 Json PluginRecord::toJson() const {
   Json j = Json::object();
@@ -193,10 +193,10 @@ std::vector<PluginRecord> PluginDb::all() const {
 }
 
 bool PluginDb::find(const std::string& path, int32_t shellId, PluginRecord& out) const {
-  auto lp = foldCase(path);
+  auto lp = pathKey(path);
   std::lock_guard<std::mutex> lk(m_);
   for (auto& r : recs_)
-    if (r.shellId == shellId && foldCase(r.path) == lp) {
+    if (r.shellId == shellId && pathKey(r.path) == lp) {
       out = r;
       return true;
     }
@@ -204,11 +204,11 @@ bool PluginDb::find(const std::string& path, int32_t shellId, PluginRecord& out)
 }
 
 std::vector<PluginRecord> PluginDb::forPath(const std::string& path) const {
-  auto lp = foldCase(path);
+  auto lp = pathKey(path);
   std::vector<PluginRecord> out;
   std::lock_guard<std::mutex> lk(m_);
   for (auto& r : recs_)
-    if (foldCase(r.path) == lp) out.push_back(r);
+    if (pathKey(r.path) == lp) out.push_back(r);
   return out;
 }
 
@@ -234,17 +234,17 @@ void PluginDb::upsert(const PluginRecord& rec) {
 }
 
 void PluginDb::removeShellChildren(const std::string& path) {
-  auto lp = foldCase(path);
+  auto lp = pathKey(path);
   std::lock_guard<std::mutex> lk(m_);
   recs_.erase(std::remove_if(recs_.begin(), recs_.end(),
-                             [&](const PluginRecord& r) { return r.shellId != 0 && foldCase(r.path) == lp; }),
+                             [&](const PluginRecord& r) { return r.shellId != 0 && pathKey(r.path) == lp; }),
               recs_.end());
 }
 
 void PluginDb::prune(const std::vector<std::string>& folders) {
   std::vector<std::string> lf;
   for (auto& f : folders) {
-    auto l = foldCase(f);
+    auto l = pathKey(f);
     if (!l.empty() && l.back() != '\\' && l.back() != '/') l += '\\';
     for (auto& c : l)
       if (c == '/') c = '\\';
@@ -253,7 +253,7 @@ void PluginDb::prune(const std::vector<std::string>& folders) {
   std::lock_guard<std::mutex> lk(m_);
   recs_.erase(std::remove_if(recs_.begin(), recs_.end(),
                              [&](const PluginRecord& r) {
-                               auto lp = foldCase(r.path);
+                               auto lp = pathKey(r.path);
                                for (auto& c : lp)
                                  if (c == '/') c = '\\';
                                bool inside = false;

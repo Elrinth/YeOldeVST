@@ -5,24 +5,51 @@
 //       second instance and checks both produce sound.
 //   yov_clap_test <YeOldeVST.clap> gui <instrument|effect> <out.bmp> [vst2.dll] [seconds]
 //       opens the plugin GUI in a window, pumps messages, saves a screenshot.
+//
+// Windows: Win32 window. Linux: X11 window, with the CLAP timer / fd support an X11 plugin GUI
+// needs from its host. YOV_TEST_GENERIC=1 switches a loaded plugin to the generic editor.
 #include <clap/clap.h>
 
+#ifdef _WIN32
 #include <windows.h>
 #include <commctrl.h>
 #include <shellapi.h>
+#else
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <dlfcn.h>
+#include <poll.h>
+#include <time.h>
+#include <unistd.h>
+#endif
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
+#ifdef _WIN32
 static std::wstring wide(const std::string& s) {
   int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
   std::wstring w(n > 0 ? n - 1 : 0, L' ');
   MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
   return w;
+}
+static FILE* openOut(const std::string& path) { return _wfopen(wide(path).c_str(), L"wb"); }
+#else
+static FILE* openOut(const std::string& path) { return fopen(path.c_str(), "wb"); }
+#endif
+
+static uint64_t nowMs() {
+  return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
 }
 
 static std::atomic<bool> gCallback{false};
@@ -48,10 +75,55 @@ static const clap_host_params_t kHostParams{paramsRescan, paramsClear, paramsFlu
 static void stateDirty(const clap_host_t*) {}
 static const clap_host_state_t kHostState{stateDirty};
 
+// ---- timer / fd support (what an X11 plugin GUI runs on) ----
+struct Timer {
+  clap_id id;
+  uint32_t period;
+  uint64_t next;
+};
+static std::vector<Timer> gTimers;
+static clap_id gNextTimer = 1;
+static bool timerRegister(const clap_host_t*, uint32_t period, clap_id* id) {
+  *id = gNextTimer++;
+  gTimers.push_back({*id, std::max<uint32_t>(period, 1), nowMs() + period});
+  return true;
+}
+static bool timerUnregister(const clap_host_t*, clap_id id) {
+  auto n = gTimers.size();
+  gTimers.erase(std::remove_if(gTimers.begin(), gTimers.end(), [&](const Timer& t) { return t.id == id; }),
+                gTimers.end());
+  return gTimers.size() != n;
+}
+static const clap_host_timer_support_t kHostTimer{timerRegister, timerUnregister};
+
+struct Fd {
+  int fd;
+  clap_posix_fd_flags_t flags;
+};
+static std::vector<Fd> gFds;
+static bool fdRegister(const clap_host_t*, int fd, clap_posix_fd_flags_t flags) {
+  gFds.push_back({fd, flags});
+  return true;
+}
+static bool fdModify(const clap_host_t*, int fd, clap_posix_fd_flags_t flags) {
+  for (auto& f : gFds)
+    if (f.fd == fd) f.flags = flags;
+  return true;
+}
+static bool fdUnregister(const clap_host_t*, int fd) {
+  gFds.erase(std::remove_if(gFds.begin(), gFds.end(), [&](const Fd& f) { return f.fd == fd; }), gFds.end());
+  return true;
+}
+static const clap_host_posix_fd_support_t kHostFd{fdRegister, fdModify, fdUnregister};
+
 static const void* hostGetExt(const clap_host_t*, const char* id) {
   if (!strcmp(id, CLAP_EXT_GUI)) return &kHostGui;
   if (!strcmp(id, CLAP_EXT_PARAMS)) return &kHostParams;
   if (!strcmp(id, CLAP_EXT_STATE)) return &kHostState;
+#ifndef _WIN32
+  if (!strcmp(id, CLAP_EXT_TIMER_SUPPORT)) return &kHostTimer;
+  if (!strcmp(id, CLAP_EXT_POSIX_FD_SUPPORT)) return &kHostFd;
+#endif
   return nullptr;
 }
 static void hostRequestRestart(const clap_host_t*) { gRestart = true; }
@@ -112,6 +184,14 @@ static std::string jsonEscape(const std::string& s) {
     o += c;
   }
   return o;
+}
+
+// The state blob that loads a VST2. YOV_TEST_SANDBOXED=1 loads it in the bridge process (as
+// "Load sandboxed" does); YOV_TEST_GENERIC=1 shows the generic editor.
+static std::string testState(const char* path) {
+  return std::string("{\"format\":\"YeOldeVST\",\"version\":1,\"path\":\"") + jsonEscape(path) + "\",\"shellId\":0" +
+         (getenv("YOV_TEST_SANDBOXED") ? ",\"sandboxed\":true" : "") +
+         (getenv("YOV_TEST_GENERIC") ? ",\"genericView\":true" : "") + "}";
 }
 
 struct Instance {
@@ -252,7 +332,7 @@ static float render(Instance& in, bool instrument, std::vector<float>* wav) {
 }
 
 static void writeWav(const char* path, const std::vector<float>& d) {
-  FILE* f = _wfopen(wide(path).c_str(), L"wb");
+  FILE* f = openOut(path);
   if (!f) return;
   uint32_t bytes = (uint32_t)d.size() * 4, v;
   uint16_t s;
@@ -280,6 +360,56 @@ static void writeWav(const char* path, const std::vector<float>& d) {
   fclose(f);
 }
 
+// 24-bit bottom-up-less BMP from top-down BGR rows (stride padded to 4 bytes).
+static void writeBmp(const char* path, int w, int h, const std::vector<uint8_t>& px) {
+  int stride = ((w * 3 + 3) & ~3);
+  uint8_t fh[14] = {'B', 'M'};
+  uint8_t ih[40] = {};
+  auto put32 = [](uint8_t* p, uint32_t v) {
+    for (int i = 0; i < 4; ++i) p[i] = uint8_t(v >> (8 * i));
+  };
+  put32(fh + 2, (uint32_t)(14 + 40 + px.size()));
+  put32(fh + 10, 14 + 40);
+  put32(ih, 40);
+  put32(ih + 4, (uint32_t)w);
+  put32(ih + 8, (uint32_t)-h);  // negative: top-down
+  ih[12] = 1;
+  ih[14] = 24;
+  put32(ih + 20, (uint32_t)((size_t)stride * h));
+  FILE* f = openOut(path);
+  if (!f) return;
+  fwrite(fh, 1, 14, f);
+  fwrite(ih, 1, 40, f);
+  fwrite(px.data(), 1, px.size(), f);
+  fclose(f);
+}
+
+#ifndef _WIN32
+// Linux: what the X server shows of the window (children included).
+static void saveBmpX11(Display* d, Window w, const char* path) {
+  XWindowAttributes a;
+  XGetWindowAttributes(d, w, &a);
+  XImage* img = XGetImage(d, w, 0, 0, (unsigned)a.width, (unsigned)a.height, AllPlanes, ZPixmap);
+  if (!img) {
+    printf("XGetImage failed\n");
+    return;
+  }
+  int stride = ((a.width * 3 + 3) & ~3);
+  std::vector<uint8_t> px((size_t)stride * a.height);
+  for (int y = 0; y < a.height; ++y)
+    for (int x = 0; x < a.width; ++x) {
+      unsigned long p = XGetPixel(img, x, y);
+      uint8_t* o = &px[(size_t)y * stride + x * 3];
+      o[0] = (uint8_t)(p & 0xFF);
+      o[1] = (uint8_t)((p >> 8) & 0xFF);
+      o[2] = (uint8_t)((p >> 16) & 0xFF);
+    }
+  XDestroyImage(img);
+  writeBmp(path, a.width, a.height, px);
+}
+#endif
+
+#ifdef _WIN32
 static void saveBmp(HWND w, const char* path) {
   RECT rc;
   GetClientRect(w, &rc);
@@ -311,7 +441,11 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
   }
   return DefWindowProcW(h, m, w, l);
 }
+#endif
 
+static void sleepMs(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
+
+#ifdef _WIN32
 int main(int, char**) {
   // Arguments as UTF-8 (plugin paths may be Cyrillic etc.).
   int argc = 0;
@@ -336,6 +470,19 @@ int main(int, char**) {
     return 2;
   }
   auto entry = (const clap_plugin_entry_t*)GetProcAddress(mod, "clap_entry");
+#else
+int main(int argc, char** argv) {
+  if (argc < 4) {
+    printf("usage: see source\n");
+    return 1;
+  }
+  void* mod = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+  if (!mod) {
+    printf("cannot load %s: %s\n", argv[1], dlerror());
+    return 2;
+  }
+  auto entry = (const clap_plugin_entry_t*)dlsym(mod, "clap_entry");
+#endif
   entry->init(argv[1]);
   auto f = (const clap_plugin_factory_t*)entry->get_factory(CLAP_PLUGIN_FACTORY_ID);
   std::string mode = argv[2];
@@ -347,8 +494,7 @@ int main(int, char**) {
   printf("factory has %u plugins\n", f->get_plugin_count(f));
 
   if (mode == "render" && argc >= 5) {
-    std::string state = std::string("{\"format\":\"YeOldeVST\",\"version\":1,\"path\":\"") + jsonEscape(argv[4]) +
-                        "\",\"shellId\":0}";
+    std::string state = testState(argv[4]);
     Instance a = create(f, id);
     {
       // What a host that reads the list only once (right after creating us) gets.
@@ -399,7 +545,7 @@ int main(int, char**) {
       gParamOut = 0;
       a.params->flush(a.p, &in, &out);
       a.params->flush(a.p, nullptr, &out);  // anything the plugin reported back
-      Sleep(400);  // a bridged plugin's value cache refreshes a few times a second
+      sleepMs(400);  // a bridged plugin's value cache refreshes a few times a second
       double v = -1;
       a.params->get_value(a.p, 3, &v);
       char txt[64] = {};
@@ -428,6 +574,86 @@ int main(int, char**) {
     return ok ? 0 : 3;
   }
 
+#ifndef _WIN32
+  if (mode == "gui" && argc >= 5) {
+    Display* d = XOpenDisplay(nullptr);
+    if (!d) {
+      printf("no X display\n");
+      return 4;
+    }
+    Instance a = create(f, id);
+    if (argc >= 6 && argv[5][0]) loadState(a, testState(argv[5]));
+    a.p->activate(a.p, 44100, 32, 512);
+    if (!a.gui->create(a.p, CLAP_WINDOW_API_X11, false)) {
+      printf("gui create failed\n");
+      return 5;
+    }
+    uint32_t w = 0, h = 0;
+    a.gui->get_size(a.p, &w, &h);
+    XSetWindowAttributes wa{};
+    wa.background_pixel = BlackPixel(d, DefaultScreen(d));
+    wa.event_mask = StructureNotifyMask;
+    Window top = XCreateWindow(d, DefaultRootWindow(d), 40, 40, w, h, 0, CopyFromParent, InputOutput, CopyFromParent,
+                               CWBackPixel | CWEventMask, &wa);
+    XStoreName(d, top, "YeOldeVST test");
+    XMapWindow(d, top);
+    XSync(d, False);
+    clap_window_t win{CLAP_WINDOW_API_X11};
+    win.x11 = top;
+    a.gui->set_parent(a.p, &win);
+    a.gui->show(a.p);
+    auto timerExt = (const clap_plugin_timer_support_t*)a.p->get_extension(a.p, CLAP_EXT_TIMER_SUPPORT);
+    auto fdExt = (const clap_plugin_posix_fd_support_t*)a.p->get_extension(a.p, CLAP_EXT_POSIX_FD_SUPPORT);
+    printf("gui: %ux%u, %zu timers, %zu fds\n", w, h, gTimers.size(), gFds.size());
+    int seconds = argc >= 7 ? atoi(argv[6]) : 3;
+    uint64_t end = nowMs() + (uint64_t)seconds * 1000;
+    while (nowMs() < end) {
+      // The host's event loop: plugin fds, plugin timers, our own window.
+      std::vector<pollfd> pfds;
+      for (auto& fd : gFds) pfds.push_back({fd.fd, (short)((fd.flags & CLAP_POSIX_FD_READ ? POLLIN : 0) |
+                                                         (fd.flags & CLAP_POSIX_FD_WRITE ? POLLOUT : 0)),
+                                            0});
+      uint64_t now = nowMs();
+      uint64_t next = now + 10;
+      for (auto& t : gTimers) next = std::min(next, t.next);
+      poll(pfds.data(), pfds.size(), (int)(next > now ? next - now : 0));
+      for (auto& p : pfds)
+        if (p.revents && fdExt)
+          fdExt->on_fd(a.p, p.fd, (p.revents & POLLIN ? CLAP_POSIX_FD_READ : 0) |
+                                      (p.revents & POLLOUT ? CLAP_POSIX_FD_WRITE : 0) |
+                                      (p.revents & (POLLERR | POLLHUP) ? CLAP_POSIX_FD_ERROR : 0));
+      now = nowMs();
+      auto timers = gTimers;
+      for (auto& t : timers)
+        if (t.next <= now) {
+          for (auto& real : gTimers)
+            if (real.id == t.id) real.next = now + real.period;
+          if (timerExt) timerExt->on_timer(a.p, t.id);
+        }
+      while (XPending(d)) {
+        XEvent ev;
+        XNextEvent(d, &ev);
+      }
+      mainThreadPump(a);
+      if (gReqW) {
+        XResizeWindow(d, top, gReqW, gReqH);
+        XSync(d, False);
+        a.gui->set_size(a.p, gReqW, gReqH);
+        gReqW = gReqH = 0;
+      }
+    }
+    XSync(d, False);
+    saveBmpX11(d, top, argv[4]);
+    a.gui->destroy(a.p);
+    a.p->deactivate(a.p);
+    a.p->destroy(a.p);
+    XDestroyWindow(d, top);
+    XCloseDisplay(d);
+    entry->deinit();
+    printf("saved %s\n", argv[4]);
+    return 0;
+  }
+#else
   if (mode == "gui" && argc >= 5) {
     WNDCLASSW wc{};
     wc.lpfnWndProc = wndProc;
@@ -436,11 +662,7 @@ int main(int, char**) {
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     RegisterClassW(&wc);
     Instance a = create(f, id);
-    if (argc >= 6) {
-      std::string state = std::string("{\"format\":\"YeOldeVST\",\"version\":1,\"path\":\"") + jsonEscape(argv[5]) +
-                          "\",\"shellId\":0}";
-      loadState(a, state);
-    }
+    if (argc >= 6) loadState(a, testState(argv[5]));
     a.p->activate(a.p, 44100, 32, 512);
     a.gui->create(a.p, CLAP_WINDOW_API_WIN32, false);
     uint32_t w = 0, h = 0;
@@ -524,5 +746,6 @@ int main(int, char**) {
     printf("saved %s\n", argv[4]);
     return 0;
   }
+#endif
   return 1;
 }

@@ -11,6 +11,9 @@
 //    answers. audioReq / audioResp events, plus sequence numbers so a late answer is detected.
 //  * notifications: plugin -> client messages (automation, editor resize...) in a ring buffer,
 //    with a notify event.
+//
+// The events are named kernel events on Windows and words in Shared::wake elsewhere (see
+// platform/Ipc.h).
 #pragma once
 
 #include <cstdint>
@@ -18,7 +21,7 @@
 namespace yov::bridge {
 
 constexpr uint32_t kMagic = 0x594F5642;  // 'YOVB'
-constexpr uint32_t kVersion = 2;
+constexpr uint32_t kVersion = 3;
 
 constexpr uint32_t kCtrlDataSize = 1u << 20;  // larger payloads travel in a separate mapping
 constexpr uint32_t kMaxChannels = 64;         // per direction
@@ -46,7 +49,7 @@ enum Op : uint32_t {
   OpSetChunk,         // index: 1 preset / 0 bank, data (or big mapping)
   OpSetParameter,     // index, dvalue
   OpEditorRect,       // -> result packed (w << 16 | h)
-  OpEditorOpen,       // value: parent HWND -> result packed size, 0 = failed
+  OpEditorOpen,       // value: parent window (HWND / X11 window id) -> result packed size, 0 = failed
   OpEditorClose,
   OpRefreshParams,    // re-read all parameter values into the cache
   OpQuit,
@@ -126,6 +129,9 @@ struct Audio {
   float out[kMaxChannels][kMaxFrames];
 };
 
+enum Wake { WakeCtrlReq, WakeCtrlResp, WakeAudioReq, WakeAudioResp, WakeNotify };
+constexpr const char* kWakeSuffix[] = {"-creq", "-cresp", "-areq", "-aresp", "-notify"};
+
 enum NotifyType : int32_t { NAutomate = 1, NBeginEdit, NEndEdit, NSizeWindow, NIOChanged, NUpdateDisplay };
 
 struct Notify {
@@ -143,8 +149,9 @@ struct Shared {
   volatile int32_t ready;
   volatile int32_t dead;  // the hosted plugin faulted (bridge itself still alive)
   char deathReason[512];
+  uint32_t wake[8];       // POSIX: the event words (WakeCtrlReq...)
   Info info;
-  volatile int32_t ringLock;
+  int32_t ringLock;       // spin lock, used atomically
   volatile uint32_t ringWrite;
   volatile uint32_t ringRead;
   Notify ring[kRingSize];
@@ -154,13 +161,5 @@ struct Shared {
 };
 
 #pragma pack(pop)
-
-// Kernel object names derived from the base name.
-inline void objectName(char* out, size_t cap, const char* base, const char* suffix) {
-  int n = 0;
-  for (const char* s = base; *s && n + 1 < (int)cap; ++s) out[n++] = *s;
-  for (const char* s = suffix; *s && n + 1 < (int)cap; ++s) out[n++] = *s;
-  out[n] = 0;
-}
 
 }  // namespace yov::bridge

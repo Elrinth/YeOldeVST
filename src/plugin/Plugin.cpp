@@ -4,8 +4,6 @@
 #include "common/Util.h"
 #include "plugin/Gui.h"
 
-#include <windows.h>
-
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -176,18 +174,18 @@ struct PluginGlue {
 
   // gui
   static bool guiIsApiSupported(const clap_plugin_t*, const char* api, bool floating) {
-    return !floating && std::strcmp(api, CLAP_WINDOW_API_WIN32) == 0;
+    return !floating && std::strcmp(api, Gui::windowApi()) == 0;
   }
   static bool guiGetPreferredApi(const clap_plugin_t*, const char** api, bool* floating) {
-    *api = CLAP_WINDOW_API_WIN32;
+    *api = Gui::windowApi();
     *floating = false;
     return true;
   }
   static bool guiCreate(const clap_plugin_t* p, const char* api, bool floating) {
-    if (floating || std::strcmp(api, CLAP_WINDOW_API_WIN32) != 0) return false;
+    if (floating || std::strcmp(api, Gui::windowApi()) != 0) return false;
     auto s = self(p);
-    if (!s->gui_) s->gui_ = std::make_unique<Gui>(*s);
-    return true;
+    if (!s->gui_) s->gui_ = Gui::create(*s);
+    return s->gui_ != nullptr;
   }
   static void guiDestroy(const clap_plugin_t* p) { self(p)->gui_.reset(); }
   static bool guiSetScale(const clap_plugin_t*, double) { return false; }  // we follow the window's DPI
@@ -218,7 +216,7 @@ struct PluginGlue {
   }
   static bool guiSetParent(const clap_plugin_t* p, const clap_window_t* win) {
     auto s = self(p);
-    return s->gui_ && s->gui_->setParent((HWND)win->win32);
+    return s->gui_ && s->gui_->setParent(win);
   }
   static bool guiSetTransient(const clap_plugin_t*, const clap_window_t*) { return false; }
   static void guiSuggestTitle(const clap_plugin_t*, const char*) {}
@@ -236,6 +234,16 @@ struct PluginGlue {
                                          guiSetScale,       guiGetSize,         guiCanResize,   guiGetResizeHints,
                                          guiAdjustSize,     guiSetSize,         guiSetParent,   guiSetTransient,
                                          guiSuggestTitle,   guiShow,            guiHide};
+
+  // timer / fd support: how an X11 GUI gets called on the host's main thread
+  static void onTimer(const clap_plugin_t* p, clap_id id) {
+    if (auto& g = self(p)->gui_) g->onTimer(id);
+  }
+  static constexpr clap_plugin_timer_support_t timerSupport{onTimer};
+  static void onFd(const clap_plugin_t* p, int fd, clap_posix_fd_flags_t flags) {
+    if (auto& g = self(p)->gui_) g->onFd(fd, flags);
+  }
+  static constexpr clap_plugin_posix_fd_support_t fdSupport{onFd};
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -272,26 +280,27 @@ Plugin::Plugin(const clap_host_t* host, Flavour flavour)
 Plugin::~Plugin() = default;
 
 bool Plugin::init() {
-  mainThreadId_ = GetCurrentThreadId();
+  mainThreadId_ = currentThreadId();
   hostParams_ = static_cast<const clap_host_params_t*>(host_->get_extension(host_, CLAP_EXT_PARAMS));
   hostLatency_ = static_cast<const clap_host_latency_t*>(host_->get_extension(host_, CLAP_EXT_LATENCY));
   hostState_ = static_cast<const clap_host_state_t*>(host_->get_extension(host_, CLAP_EXT_STATE));
   hostGui_ = static_cast<const clap_host_gui_t*>(host_->get_extension(host_, CLAP_EXT_GUI));
   hostThreadCheck_ =
       static_cast<const clap_host_thread_check_t*>(host_->get_extension(host_, CLAP_EXT_THREAD_CHECK));
+  hostTimer_ = static_cast<const clap_host_timer_support_t*>(host_->get_extension(host_, CLAP_EXT_TIMER_SUPPORT));
+  hostFd_ = static_cast<const clap_host_posix_fd_support_t*>(host_->get_extension(host_, CLAP_EXT_POSIX_FD_SUPPORT));
   wrappedAsVst3_ = host_->name && containsNoCase(host_->name, "clap-as-vst3");
   Shared::get();
   logLine("instance created (%s) in host '%s'", instrument_ ? "instrument" : "effect",
           host_->name ? host_->name : "?");
   // Testing aid: start new instances with a plugin already loaded, so host test tools that
   // can't pass a state still exercise a real VST2.
-  wchar_t autoload[2048];
-  DWORD n = GetEnvironmentVariableW(L"YEOLDEVST_TEST_AUTOLOAD", autoload, 2048);
-  if (n > 0 && n < 2048) {
+  std::string autoload;
+  if (getEnv("YEOLDEVST_TEST_AUTOLOAD", autoload) && !autoload.empty()) {
     initializing_ = true;  // the host is not ready for rescan / restart requests yet
     PluginRecord rec;
-    rec.path = narrow(autoload);
-    rec.arch = archName(readPeInfo(rec.path).arch);
+    rec.path = autoload;
+    rec.arch = archName(readModuleInfo(rec.path).arch);
     std::string err;
     if (!loadVst(rec, false, err)) logLine("autoload failed: %s", err.c_str());
     initializing_ = false;
@@ -314,7 +323,7 @@ void Plugin::destroy() {
 
 bool Plugin::isMainThread() const {
   if (hostThreadCheck_) return hostThreadCheck_->is_main_thread(host_);
-  return GetCurrentThreadId() == mainThreadId_;
+  return currentThreadId() == mainThreadId_;
 }
 
 void Plugin::Slot::allocate(uint32_t frames) {
@@ -362,6 +371,10 @@ const void* Plugin::getExtension(const char* id) {
   if (!std::strcmp(id, CLAP_EXT_LATENCY)) return &PluginGlue::latency;
   if (!std::strcmp(id, CLAP_EXT_TAIL)) return &PluginGlue::tail;
   if (!std::strcmp(id, CLAP_EXT_GUI)) return &PluginGlue::gui;
+#if !defined(_WIN32) && !defined(__APPLE__)
+  if (!std::strcmp(id, CLAP_EXT_TIMER_SUPPORT)) return &PluginGlue::timerSupport;
+  if (!std::strcmp(id, CLAP_EXT_POSIX_FD_SUPPORT)) return &PluginGlue::fdSupport;
+#endif
   return nullptr;
 }
 
@@ -487,7 +500,7 @@ void Plugin::hostSetParameter(HostedPlugin* h, uint32_t index, double value) {
   float v = (float)std::clamp(value, 0.0, 1.0);
   if (index < kMaxParams) {
     hostSet_[index].value.store(v, std::memory_order_relaxed);
-    hostSet_[index].ms.store((uint32_t)GetTickCount64(), std::memory_order_relaxed);
+    hostSet_[index].ms.store((uint32_t)nowMs(), std::memory_order_relaxed);
   }
   h->setParameter((int32_t)index, v);
 }
@@ -498,7 +511,7 @@ void Plugin::vstAutomate(int32_t index, float value) {
   // after the call): passing it on would look like the user turned the knob.
   auto& hs = hostSet_[index];
   if (std::fabs(hs.value.load(std::memory_order_relaxed) - value) < 1e-6f &&
-      (uint32_t)GetTickCount64() - hs.ms.load(std::memory_order_relaxed) < 500)
+      (uint32_t)nowMs() - hs.ms.load(std::memory_order_relaxed) < 500)
     return;
   queueOut({OutEvent::Value, (uint32_t)index, (double)value});
   if (hostParams_) hostParams_->request_flush(host_);
@@ -572,7 +585,7 @@ void Plugin::updateTime(const clap_event_transport_t* t, uint32_t frames) {
   VstTimeInfo& ti = time_;
   ti.sampleRate = sampleRate_;
   int32_t flags = kVstNanosValid;
-  ti.nanoSeconds = (double)GetTickCount64() * 1e6;
+  ti.nanoSeconds = (double)nowMs() * 1e6;
   if (t) {
     bool playing = (t->flags & CLAP_TRANSPORT_IS_PLAYING) != 0;
     if (playing) flags |= kVstTransportPlaying;
@@ -1023,7 +1036,7 @@ bool Plugin::applyStateJson(const std::string& text, std::string& error) {
       rec = found;
     }
   }
-  if (rec.arch.empty()) rec.arch = archName(readPeInfo(rec.path).arch);
+  if (rec.arch.empty()) rec.arch = archName(readModuleInfo(rec.path).arch);
   if (!fileExists(rec.path)) {
     if (gui_ && slot_) gui_->beforeUnload(slot_->plugin.get());
     installSlot(nullptr);

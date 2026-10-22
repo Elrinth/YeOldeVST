@@ -1,4 +1,4 @@
-// YeOldeVST-Host64.exe / YeOldeVST-Host32.exe
+// YeOldeVST-Host64(.exe) / YeOldeVST-Host32.exe
 //
 // Helper process used by the plugin:
 //   --probe <dll> [--shell-id N] [--editor]   test one plugin, report on stdout (scanner)
@@ -14,10 +14,10 @@
 #include "hostexe/Probe.h"
 #include "scan/Scanner.h"
 
-#include <windows.h>
-#include <shellapi.h>
-
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <thread>
 #include <vector>
@@ -64,7 +64,7 @@ static int cmdScan(const std::vector<std::string>& args) {
 }
 
 static void writeWav(const std::string& path, const std::vector<float>& interleaved, int channels, int sr) {
-  FILE* f = _wfopen(widen(path).c_str(), L"wb");
+  FILE* f = openFile(path, "wb");
   if (!f) return;
   uint32_t dataBytes = (uint32_t)(interleaved.size() * 4);
   auto u32 = [&](uint32_t v) { fwrite(&v, 4, 1, f); };
@@ -146,9 +146,7 @@ static int cmdRender(const std::string& dll, const std::string& out, int32_t she
   return 0;
 }
 
-int wmain(int argc, wchar_t** argv) {
-  std::vector<std::string> args;
-  for (int i = 1; i < argc; ++i) args.push_back(narrow(argv[i]));
+static int run(const std::vector<std::string>& args) {
   if (args.empty()) return usage();
 
   if (args[0] == "--probe" && args.size() >= 2) {
@@ -172,3 +170,14 @@ int wmain(int argc, wchar_t** argv) {
   }
   return usage();
 }
+
+#ifdef _WIN32
+// Arguments as UTF-8 (plugin paths may be Cyrillic etc.).
+int wmain(int argc, wchar_t** argv) {
+  std::vector<std::string> args;
+  for (int i = 1; i < argc; ++i) args.push_back(narrow(argv[i]));
+  return run(args);
+}
+#else
+int main(int argc, char** argv) { return run(std::vector<std::string>(argv + 1, argv + argc)); }
+#endif

@@ -65,6 +65,8 @@ class Plugin final : public HostedPlugin::Listener {
   void setGenericView(bool g) { genericView_ = g; }
   void requestResize(uint32_t w, uint32_t h);
   const clap_host_t* host() const { return host_; }
+  const clap_host_timer_support_t* hostTimer() const { return hostTimer_; }
+  const clap_host_posix_fd_support_t* hostFd() const { return hostFd_; }
   bool isMainThread() const;
 
   // ---- HostedPlugin::Listener (from the VST2 plugin, any thread) ----
@@ -136,10 +138,12 @@ class Plugin final : public HostedPlugin::Listener {
   const clap_host_state_t* hostState_ = nullptr;
   const clap_host_gui_t* hostGui_ = nullptr;
   const clap_host_thread_check_t* hostThreadCheck_ = nullptr;
+  const clap_host_timer_support_t* hostTimer_ = nullptr;
+  const clap_host_posix_fd_support_t* hostFd_ = nullptr;
   bool instrument_;
   uint32_t outPairs_ = 1;
   bool wrappedAsVst3_ = false;
-  uint32_t mainThreadId_ = 0;
+  uint64_t mainThreadId_ = 0;
   clap_plugin_t plugin_;
 
   double sampleRate_ = 44100;

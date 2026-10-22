@@ -1,13 +1,14 @@
 // Fail-safe plugin scanner.
 //
-// Each plugin is probed in its own helper process (YeOldeVST-Host64/32.exe --probe) with a
+// Each plugin is probed in its own helper process (YeOldeVST-Host64/32 --probe) with a
 // timeout, so a plugin that crashes or hangs only takes down that throwaway process. Probes run
-// on a hidden desktop so nag screens and licence dialogs cannot pop up in front of the user
-// (they show up as a timeout instead). Results go into the shared PluginDb, saved as we go.
+// on a hidden desktop (Windows) or display (Xvfb on Linux, when installed) so nag screens and
+// licence dialogs cannot pop up in front of the user (they show up as a timeout instead).
+// Results go into the shared PluginDb, saved as we go.
 #pragma once
 
 #include "common/PluginDb.h"
-#include "common/PeInfo.h"
+#include "common/ModuleInfo.h"
 
 #include <atomic>
 #include <functional>
@@ -18,9 +19,12 @@
 
 namespace yov {
 
-// Locates the helper executables: next to this module first, then extracted from resources
-// embedded in this module (the plugin DLL carries both helpers so it can ship as one file).
-std::string helperExePath(PeArch arch);
+// Locates the helper executables: next to this module first, then extracted from the copies
+// embedded in this module (the plugin binary carries its helpers so it can ship as one file).
+// arch: X86 for the 32-bit helper (Windows), the native architecture for the other one.
+std::string helperExePath(Arch arch);
+// "x86" / "x64" / "arm64" as stored in PluginRecord::arch.
+Arch archFromName(const std::string& name);
 
 struct ScanProgress {
   int total = 0;
@@ -79,7 +83,8 @@ class Scanner {
   ScanProgress prog_;
 };
 
-// Recursively lists *.dll files below the folders (deduplicated, sorted).
+// Recursively lists the plugin binaries below the folders (*.dll on Windows, *.so on Linux,
+// *.vst bundles on macOS; deduplicated, sorted).
 std::vector<std::string> findPluginFiles(const std::vector<std::string>& folders);
 
 }  // namespace yov

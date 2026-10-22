@@ -1,13 +1,13 @@
 // Client side of the bridge: a HostedPlugin whose VST2 runs in a helper process.
 // 32-bit plugins always go this way; 64-bit ones when loaded "sandboxed".
 #include "common/BridgeProtocol.h"
-#include "common/PeInfo.h"
+#include "common/ModuleInfo.h"
 #include "common/Seh.h"
 #include "common/Util.h"
+#include "platform/Ipc.h"
+#include "platform/Process.h"
 #include "plugin/HostedPlugin.h"
 #include "scan/Scanner.h"
-
-#include <windows.h>
 
 #include <algorithm>
 #include <atomic>
@@ -21,23 +21,9 @@ namespace yov {
 
 namespace {
 
-HANDLE bridgeJob() {
-  static HANDLE job = [] {
-    HANDLE j = CreateJobObjectW(nullptr, nullptr);
-    if (j) {
-      JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
-      li.BasicLimitInformation.LimitFlags =
-          JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
-      SetInformationJobObject(j, JobObjectExtendedLimitInformation, &li, sizeof li);
-    }
-    return j;
-  }();
-  return job;
-}
-
 class BridgedPlugin final : public HostedPlugin {
  public:
-  BridgedPlugin(Listener* l) : listener_(l) { mainThread_ = GetCurrentThreadId(); }
+  BridgedPlugin(Listener* l) : listener_(l) { mainThread_ = currentThreadId(); }
   ~BridgedPlugin() override { shutdown(); }
 
   bool start(const std::string& path, int32_t shellId, bool is32, std::string& error);
@@ -50,17 +36,12 @@ class BridgedPlugin final : public HostedPlugin {
 
   bool dead() const override {
     if (broken_.load()) return true;
-    if (proc_ && WaitForSingleObject(proc_, 0) == WAIT_OBJECT_0) return true;
+    if (proc_.started() && proc_.exited()) return true;
     return sh_ && sh_->dead;
   }
   std::string deathReason() const override {
     if (sh_ && sh_->dead) return std::string(sh_->deathReason, strnlen(sh_->deathReason, sizeof sh_->deathReason));
-    DWORD code = 0;
-    if (proc_ && WaitForSingleObject(proc_, 0) == WAIT_OBJECT_0 && GetExitCodeProcess(proc_, &code)) {
-      char b[160];
-      snprintf(b, sizeof b, "the plugin's process ended: %s (0x%08lX)", exceptionName(code), code);
-      return b;
-    }
+    if (proc_.started() && proc_.exited()) return "the plugin's process ended: " + proc_.exitDescription("");
     if (broken_.load()) return "the plugin stopped responding and was shut down";
     return {};
   }
@@ -116,7 +97,7 @@ class BridgedPlugin final : public HostedPlugin {
   void setParameter(int32_t i, float v) override {
     if (!sh_ || i < 0) return;
     if (i < (int32_t)kParamCache) sh_->paramCache[i] = v;
-    if (GetCurrentThreadId() == mainThread_ && !audioRunning()) {
+    if (currentThreadId() == mainThread_ && !audioRunning()) {
       call(OpSetParameter, i, 0, v);
       return;
     }
@@ -154,7 +135,7 @@ class BridgedPlugin final : public HostedPlugin {
 
  private:
   bool call(uint32_t op, int32_t index = 0, int64_t value = 0, double dvalue = 0, const void* data = nullptr,
-            size_t size = 0, std::vector<uint8_t>* out = nullptr, DWORD timeoutMs = 15000);
+            size_t size = 0, std::vector<uint8_t>* out = nullptr, uint32_t timeoutMs = 15000);
   std::string callString(uint32_t op, int32_t index) {
     std::vector<uint8_t> out;
     if (!call(op, index, 0, 0, nullptr, 0, &out)) return {};
@@ -176,7 +157,7 @@ class BridgedPlugin final : public HostedPlugin {
     info_.hasEditor = i.hasEditor != 0;
     info_.usesChunks = i.usesChunks != 0;
   }
-  bool audioRunning() const { return GetTickCount64() - lastProcessMs_.load() < 200; }
+  bool audioRunning() const { return nowMs() - lastProcessMs_.load() < 200; }
   void notifyLoop();
   void shutdown();
 
@@ -218,10 +199,11 @@ class BridgedPlugin final : public HostedPlugin {
   std::vector<uint8_t> outEvStore_;
 
   Listener* listener_;
-  DWORD mainThread_ = 0;
+  uint64_t mainThread_ = 0;
   std::string base_;
-  HANDLE map_ = nullptr, ctrlReq_ = nullptr, ctrlResp_ = nullptr, audioReq_ = nullptr, audioResp_ = nullptr,
-         notify_ = nullptr, proc_ = nullptr;
+  SharedMemory map_;
+  IpcEvent ctrlReq_, ctrlResp_, audioReq_, audioResp_, notify_;
+  mutable ChildProcess proc_;
   Shared* sh_ = nullptr;
   HostedInfo info_;
   std::mutex callM_;
@@ -242,11 +224,11 @@ class BridgedPlugin final : public HostedPlugin {
 };
 
 bool BridgedPlugin::call(uint32_t op, int32_t index, int64_t value, double dvalue, const void* data, size_t size,
-                         std::vector<uint8_t>* out, DWORD timeoutMs) {
+                         std::vector<uint8_t>* out, uint32_t timeoutMs) {
   std::lock_guard<std::mutex> lk(callM_);
-  if (!sh_ || broken_.load() || (proc_ && WaitForSingleObject(proc_, 0) == WAIT_OBJECT_0)) return false;
+  if (!sh_ || broken_.load() || (proc_.started() && proc_.exited())) return false;
   Ctrl& c = sh_->ctrl;
-  HANDLE bigReq = nullptr;
+  SharedMemory bigReq;
   c.op = op;
   c.index = index;
   c.value = value;
@@ -255,72 +237,41 @@ bool BridgedPlugin::call(uint32_t op, int32_t index, int64_t value, double dvalu
   c.dataSize = 0;
   c.result = 0;
   if (size > kCtrlDataSize) {
-    char nm[96];
-    snprintf(nm, sizeof nm, "%s-req%u", base_.c_str(), ctrlSeq_ + 1);
-    bigReq = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, (DWORD)((uint64_t)size >> 32),
-                                (DWORD)size, nm);
-    if (!bigReq) return false;
-    void* p = MapViewOfFile(bigReq, FILE_MAP_WRITE, 0, 0, size);
-    if (!p) {
-      CloseHandle(bigReq);
-      return false;
-    }
-    memcpy(p, data, size);
-    UnmapViewOfFile(p);
-    snprintf(c.bigName, sizeof c.bigName, "%s", nm);
+    std::string nm = ipcName(base_, ("-req" + std::to_string(ctrlSeq_ + 1)).c_str());
+    if (!bigReq.create(nm, size)) return false;
+    memcpy(bigReq.data(), data, size);
+    snprintf(c.bigName, sizeof c.bigName, "%s", nm.c_str());
     c.bigSize = (uint32_t)size;
   } else if (size) {
     memcpy(c.data, data, size);
     c.dataSize = (uint32_t)size;
   }
   c.seq = ++ctrlSeq_;
-  WaitForSingleObject(ctrlResp_, 0);  // drop a stale signal
-  MemoryBarrier();
-  SetEvent(ctrlReq_);
+  ctrlResp_.reset();  // drop a stale signal
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  ctrlReq_.signal();
 
   // Wait, but keep handling messages sent to this thread: the bridge's editor window is a child
   // of ours, and Windows sends it messages synchronously across processes.
-  HANDLE waits[2] = {ctrlResp_, proc_};
-  ULONGLONG deadline = GetTickCount64() + timeoutMs;
-  bool ok = false;
-  for (;;) {
-    ULONGLONG now = GetTickCount64();
-    if (now >= deadline) break;
-    DWORD r = MsgWaitForMultipleObjects(2, waits, FALSE, (DWORD)(deadline - now), QS_SENDMESSAGE);
-    if (r == WAIT_OBJECT_0) {
-      ok = true;
-      break;
-    }
-    if (r == WAIT_OBJECT_0 + 1) break;  // bridge process died
-    if (r == WAIT_OBJECT_0 + 2) {
-      MSG m;
-      PeekMessageW(&m, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
-      continue;
-    }
-    break;
-  }
-  if (bigReq) CloseHandle(bigReq);
+  bool ok = waitForReply(ctrlResp_, proc_, timeoutMs) == WaitResult::Signaled;
+  bigReq.close();
   if (!ok) {
-    if (WaitForSingleObject(proc_, 0) != WAIT_OBJECT_0) {
-      logLine("bridge did not answer op %u within %lu ms; shutting it down", op, timeoutMs);
+    if (!proc_.exited()) {
+      logLine("bridge did not answer op %u within %lu ms; shutting it down", op, (unsigned long)timeoutMs);
       broken_ = true;
-      TerminateProcess(proc_, 0xDEAD);
+      proc_.kill(0xDEAD);
     }
     return false;
   }
-  MemoryBarrier();
+  std::atomic_thread_fence(std::memory_order_seq_cst);
   lastResult_ = c.result;
   if (out) {
     out->clear();
     if (c.bigSize) {
-      HANDLE m = OpenFileMappingA(FILE_MAP_READ, FALSE, c.bigName);
-      if (m) {
-        if (void* p = MapViewOfFile(m, FILE_MAP_READ, 0, 0, c.bigSize)) {
-          out->assign((uint8_t*)p, (uint8_t*)p + c.bigSize);
-          UnmapViewOfFile(p);
-        }
-        CloseHandle(m);
-      }
+      SharedMemory m;
+      std::string name(c.bigName, strnlen(c.bigName, sizeof c.bigName));
+      if (m.open(name, c.bigSize, true)) out->assign((uint8_t*)m.data(), (uint8_t*)m.data() + c.bigSize);
+      SharedMemory::unlinkName(name);  // read: nothing needs the name any more
     } else {
       out->assign(c.data, c.data + std::min(c.dataSize, kCtrlDataSize));
     }
@@ -329,62 +280,34 @@ bool BridgedPlugin::call(uint32_t op, int32_t index, int64_t value, double dvalu
 }
 
 bool BridgedPlugin::start(const std::string& path, int32_t shellId, bool is32, std::string& error) {
-  std::string exe = helperExePath(is32 ? PeArch::X86 : PeArch::X64);
+  std::string exe = helperExePath(is32 ? Arch::X86 : nativeArch());
   if (exe.empty()) {
     error = is32 ? "the 32-bit helper (YeOldeVST-Host32.exe) is missing" : "the 64-bit helper is missing";
     return false;
   }
-  static std::atomic<uint32_t> counter{0};
-  char nm[160];
-  snprintf(nm, sizeof nm, "Local\\YeOldeVST-%lu-%u-%llu", GetCurrentProcessId(), ++counter,
-           (unsigned long long)GetTickCount64());
-  base_ = nm;
+  base_ = ipcBaseName();
   size_t size = sizeof(Shared);
-  map_ = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, (DWORD)((uint64_t)size >> 32), (DWORD)size,
-                            base_.c_str());
-  if (!map_) {
+  if (!map_.create(base_, size)) {
     error = "could not create shared memory";
     return false;
   }
-  sh_ = (Shared*)MapViewOfFile(map_, FILE_MAP_ALL_ACCESS, 0, 0, size);
-  if (!sh_) {
-    error = "could not map shared memory";
-    return false;
-  }
+  sh_ = (Shared*)map_.data();
   memset(sh_, 0, offsetof(Shared, ctrl));
   sh_->magic = kMagic;
   sh_->version = kVersion;
-  sh_->clientPid = GetCurrentProcessId();
-  auto ev = [&](const char* suffix) {
-    char en[200];
-    objectName(en, sizeof en, base_.c_str(), suffix);
-    return CreateEventA(nullptr, FALSE, FALSE, en);
-  };
-  ctrlReq_ = ev("-creq");
-  ctrlResp_ = ev("-cresp");
-  audioReq_ = ev("-areq");
-  audioResp_ = ev("-aresp");
-  notify_ = ev("-notify");
-  if (!ctrlReq_ || !ctrlResp_ || !audioReq_ || !audioResp_ || !notify_) {
-    error = "could not create events";
-    return false;
-  }
+  sh_->clientPid = currentProcessId();
+  IpcEvent* events[] = {&ctrlReq_, &ctrlResp_, &audioReq_, &audioResp_, &notify_};
+  for (int i = 0; i < 5; ++i)
+    if (!events[i]->create(ipcName(base_, kWakeSuffix[i]), &sh_->wake[i])) {
+      error = "could not create events";
+      return false;
+    }
 
-  std::wstring cmd = L"\"" + widen(exe) + L"\" --bridge " + widen(base_);
-  std::wstring dir = widen(dirOf(path));
-  STARTUPINFOW si{sizeof si};
-  PROCESS_INFORMATION pi{};
-  if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr,
-                      dir.empty() ? nullptr : dir.c_str(), &si, &pi)) {
-    error = "could not start the helper process (error " + std::to_string(GetLastError()) + ")";
-    return false;
-  }
-  if (HANDLE job = bridgeJob()) AssignProcessToJobObject(job, pi.hProcess);
-  ResumeThread(pi.hThread);
-  CloseHandle(pi.hThread);
-  proc_ = pi.hProcess;
-  // The helper may show the plugin's dialogs: let it take the foreground.
-  AllowSetForegroundWindow(pi.dwProcessId);
+  SpawnOptions so;
+  so.cwd = dirOf(path);
+  so.group = SpawnOptions::Group::Bridge;
+  so.allowForeground = true;  // the helper may show the plugin's dialogs: let it take the foreground
+  if (!proc_.start(exe, {"--bridge", base_}, so, error)) return false;
 
   notifyThread_ = std::thread([this] { notifyLoop(); });
 
@@ -392,6 +315,7 @@ bool BridgedPlugin::start(const std::string& path, int32_t shellId, bool is32, s
     error = "the helper process did not start: " + deathReason();
     return false;
   }
+  map_.unlinkName();  // both sides have it mapped now; nothing is left behind if either dies
   std::vector<uint8_t> out;
   // Loading can show licence / registration dialogs: give the user time.
   if (!call(OpLoad, shellId, 0, 0, path.data(), path.size(), &out, 300000)) {
@@ -404,16 +328,17 @@ bool BridgedPlugin::start(const std::string& path, int32_t shellId, bool is32, s
     return false;
   }
   copyInfo();
-  logLine("bridge %s up for %s (pid %lu)", is32 ? "x86" : "x64", path.c_str(), pi.dwProcessId);
+  logLine("bridge %s up for %s (pid %lu)", is32 ? "x86" : archName(nativeArch()), path.c_str(),
+          (unsigned long)proc_.pid());
   return true;
 }
 
 void BridgedPlugin::notifyLoop() {
   while (!stop_.load()) {
-    WaitForSingleObject(notify_, 100);
+    notify_.wait(100);
     if (!sh_) continue;
     while (sh_->ringRead != sh_->ringWrite && !stop_.load()) {
-      MemoryBarrier();
+      std::atomic_thread_fence(std::memory_order_seq_cst);
       Notify n = sh_->ring[sh_->ringRead % kRingSize];
       sh_->ringRead = sh_->ringRead + 1;
       if (!listener_) continue;
@@ -432,7 +357,7 @@ void BridgedPlugin::notifyLoop() {
 bool BridgedPlugin::process(float** in, float** out, int32_t frames, const vst2::VstEvents* events,
                             const vst2::VstTimeInfo& time) {
   if (!sh_ || dead()) return false;
-  lastProcessMs_ = GetTickCount64();
+  lastProcessMs_ = nowMs();
   Audio& a = sh_->audio;
   if (audioPending_) {
     // The previous block timed out. Skip until the bridge has caught up.
@@ -486,26 +411,26 @@ bool BridgedPlugin::process(float** in, float** out, int32_t frames, const vst2:
     for (int c = 0; c < nin; ++c) memcpy(a.in[c], in[c] + offset, sizeof(float) * (size_t)n);
 
     a.seq = ++audioSeq_;
-    WaitForSingleObject(audioResp_, 0);  // drop a stale signal
-    MemoryBarrier();
-    SetEvent(audioReq_);
+    audioResp_.reset();  // drop a stale signal
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    audioReq_.signal();
     double blockMs = n / std::max(1.0, sr_) * 1000.0;
-    ULONGLONG deadline = GetTickCount64() + (ULONGLONG)std::max(20.0, blockMs * 3.0);
+    uint64_t deadline = nowMs() + (uint64_t)std::max(20.0, blockMs * 3.0);
     bool done = false;
     for (;;) {
-      ULONGLONG now = GetTickCount64();
+      uint64_t now = nowMs();
       if (a.doneSeq == audioSeq_) {
         done = true;
         break;
       }
       if (now >= deadline) break;
-      WaitForSingleObject(audioResp_, (DWORD)(deadline - now));
+      audioResp_.wait((uint32_t)(deadline - now));
     }
     if (!done) {
       audioPending_ = true;
       return false;
     }
-    MemoryBarrier();
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     forwardMidiOut(a, offset);
     if (!a.ok) return false;
     for (int c = 0; c < nout; ++c) memcpy(out[c] + offset, a.out[c], sizeof(float) * (size_t)n);
@@ -515,23 +440,20 @@ bool BridgedPlugin::process(float** in, float** out, int32_t frames, const vst2:
 }
 
 void BridgedPlugin::shutdown() {
-  if (proc_ && !dead()) {
+  if (proc_.started() && !dead()) {
     if (editorOpen_) editorClose();
     call(OpQuit, 0, 0, 0, nullptr, 0, nullptr, 3000);
-    if (WaitForSingleObject(proc_, 3000) != WAIT_OBJECT_0) TerminateProcess(proc_, 0);
-  } else if (proc_) {
-    TerminateProcess(proc_, 0);
+    if (!proc_.wait(3000)) proc_.kill(0);
+  } else if (proc_.started()) {
+    proc_.kill(0);
   }
+  if (proc_.started()) proc_.wait(2000);
   stop_ = true;
-  if (notify_) SetEvent(notify_);
+  if (notify_.valid()) notify_.signal();
   if (notifyThread_.joinable()) notifyThread_.join();
-  for (HANDLE h : {ctrlReq_, ctrlResp_, audioReq_, audioResp_, notify_, proc_})
-    if (h) CloseHandle(h);
-  if (sh_) UnmapViewOfFile(sh_);
-  if (map_) CloseHandle(map_);
+  for (IpcEvent* e : {&ctrlReq_, &ctrlResp_, &audioReq_, &audioResp_, &notify_}) e->close();
   sh_ = nullptr;
-  map_ = nullptr;
-  proc_ = nullptr;
+  map_.close();
 }
 
 }  // namespace

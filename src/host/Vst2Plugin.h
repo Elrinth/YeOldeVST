@@ -127,7 +127,7 @@ class Vst2Plugin {
   int32_t blockSize_ = 512;
   bool resumed_ = false;
   bool editorOpen_ = false;
-  std::atomic<uint32_t> audioThreadId_{0};
+  std::atomic<uint64_t> audioThreadId_{0};
   vst2::VstTimeInfo time_{};
   std::vector<std::shared_ptr<std::vector<uint8_t>>> chunkKeepAlive_;
 };
