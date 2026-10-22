@@ -113,7 +113,7 @@ the VST3 build gets them from the host's run loop).
 
 ## Installing
 
-Download `YeOldeVST-1.1.0-win64.zip` from the
+Download `YeOldeVST-1.2.0-win64.zip` from the
 [Releases page](https://github.com/Elrinth/YeOldeVST/releases) and unpack it.
 
 Copy `YeOldeVST.clap` to `%LOCALAPPDATA%\Programs\Common\CLAP` or
