@@ -12,7 +12,7 @@ using namespace vst2;
 
 namespace yov {
 
-static const char* kVersion = "1.2.0";
+static const char* kVersion = "1.3.0";
 
 static std::atomic<Shared*> gShared{nullptr};
 
