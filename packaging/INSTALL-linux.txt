@@ -1,0 +1,22 @@
+YeOldeVST @VERSION@ - Linux x86_64
+
+Hosts native Linux VST 1.x/2.x plugins (.so files) in any DAW that loads CLAP or VST3.
+(Windows .dll plugins need the Windows version of YeOldeVST.)
+
+Install (pick the format your DAW uses, or both):
+
+  CLAP: copy YeOldeVST.clap to
+        ~/.clap                  (just you)
+     or /usr/lib/clap            (all users)
+
+  VST3: copy the whole YeOldeVST.vst3 folder to
+        ~/.vst3                  (just you)
+     or /usr/lib/vst3            (all users)
+
+Then rescan plugins in your DAW. Add "YeOldeVST Instrument", "YeOldeVST Instrument (multi-out)"
+or "YeOldeVST Effect" to a track, open its window, add the folders with your VST2 .so plugins
+(often ~/.vst or /usr/lib/vst) and press Scan. Double-click a plugin to load it.
+
+Needs: glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 and later), X11 or XWayland,
+OpenGL. With xvfb installed, scans run on a hidden display.
+See README.md for details.

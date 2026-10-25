@@ -129,15 +129,142 @@ jobs:
           $tag = $env:GITHUB_REF_NAME
           $v = "${{ steps.version.outputs.version }}"
           $zip = "${{ steps.package.outputs.zip }}"
-          $draft = gh release view $tag --json isDraft -q .isDraft 2>$null
-          if ($LASTEXITCODE -eq 0) {
-            # Never replace the zip of a release that is already published.
-            if ($draft -ne 'true') { throw "release $tag is already published" }
-            gh release upload $tag $zip --clobber
-          } else {
-            gh release create $tag $zip --draft --verify-tag --title "YeOldeVST $v" --notes "YeOldeVST $v for Windows 64-bit."
+          # The Linux job may create the draft at the same moment: retry a few times.
+          for ($attempt = 1; $attempt -le 5; $attempt++) {
+            $draft = gh release view $tag --json isDraft -q .isDraft 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              # Never replace the zip of a release that is already published.
+              if ($draft -ne 'true') { throw "release $tag is already published" }
+              gh release upload $tag $zip --clobber
+            } else {
+              gh release create $tag $zip --draft --verify-tag --title "YeOldeVST $v" --notes "YeOldeVST $v for Windows 64-bit and Linux x86_64."
+            }
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+            Start-Sleep -Seconds 10
           }
-          if ($LASTEXITCODE -ne 0) { throw "gh failed" }
+          throw "could not attach $zip to $tag"
+
+  # Linux: native Linux VST2 plugins (.so). Built on Ubuntu 22.04 so the result runs on glibc
+  # 2.35 and newer (Ubuntu 22.04+, Debian 12+, Fedora 36+...).
+  linux:
+    name: Linux x86_64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    permissions:
+      contents: write # for attaching the tarball to a draft release on v* tags
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build libx11-dev libgl-dev xvfb
+
+      - name: Fetch submodules
+        run: |
+          git submodule update --init --depth 1 external/clap external/clap-wrapper external/vst3sdk
+          git -C external/vst3sdk submodule update --init --depth 1 base pluginterfaces public.sdk cmake
+
+      - name: Read version
+        id: version
+        run: |
+          v=$(sed -n 's/^project(YeOldeVST VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          [ -n "$v" ] || { echo "no version in CMakeLists.txt"; exit 1; }
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$v" ]; then
+            echo "tag $GITHUB_REF_NAME does not match CMakeLists.txt version $v"; exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "YeOldeVST $v"
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test (headless CLAP host)
+        timeout-minutes: 10
+        run: |
+          bin=$(realpath build)
+          failed=0
+          echo -e "### Headless CLAP host (Linux)\n\n| Case | Result |\n|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          run_case() {  # name, outputs ("" = the test plugin's default), args...
+            local name=$1 outs=$2; shift 2
+            echo "::group::$name"
+            out=$(YOV_TEST_OUTPUTS=$outs xvfb-run -a "$bin/yov_clap_test" "$bin/YeOldeVST.clap" "$@" 2>&1); code=$?
+            echo "$out"
+            echo "::endgroup::"
+            if [ $code -eq 0 ] && grep -q '^PASS' <<<"$out"; then r=PASS; else r="FAIL (exit $code)"; failed=$((failed + 1)); fi
+            echo "$name: $r"
+            echo "| $name | $r |" >> "$GITHUB_STEP_SUMMARY"
+          }
+          run_case "instrument, VST2 .so"   "" render instrument "$bin/YovTest64.so"
+          run_case "effect, VST2 .so"       "" render effect "$bin/YovTest64.so"
+          run_case "multi-out, VST2 .so"    "" render multi "$bin/YovTest64.so"
+          run_case "128 outputs, VST2 .so"  128 render multi "$bin/YovTest64.so"
+          [ $failed -eq 0 ] || { echo "$failed test case(s) failed"; exit 1; }
+
+      - name: Build Steinberg VST3 validator
+        run: |
+          cmake -S external/vst3sdk -B build-vst3sdk -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DSMTG_ENABLE_VSTGUI_SUPPORT=OFF -DSMTG_ENABLE_VST3_PLUGIN_EXAMPLES=OFF
+          cmake --build build-vst3sdk --target validator
+
+      - name: Validate VST3
+        timeout-minutes: 10
+        run: |
+          out=$(xvfb-run -a build-vst3sdk/bin/Release/validator build/Release/YeOldeVST.vst3 2>&1); code=$?
+          echo "$out"
+          result=$(grep '^Result:' <<<"$out" | tail -1)
+          echo -e "### VST3 validator (Linux)\n\n$result" >> "$GITHUB_STEP_SUMMARY"
+          [ $code -eq 0 ] && grep -q ' 0 tests failed' <<<"$result" || { echo "VST3 validator failed (exit $code)"; exit 1; }
+
+      - name: Package
+        id: package
+        run: |
+          v=${{ steps.version.outputs.version }}
+          name=YeOldeVST-$v
+          dir=dist/$name
+          mkdir -p "$dir"
+          cp build/YeOldeVST.clap "$dir/"
+          cp -r build/Release/YeOldeVST.vst3 "$dir/"
+          cp README.md LICENSE THIRD_PARTY_LICENSES.txt "$dir/"
+          sed "s/@VERSION@/$v/" packaging/INSTALL-linux.txt > "$dir/INSTALL.txt"
+          tarball=dist/$name-linux-x86_64.tar.gz
+          tar -C dist -czf "$tarball" "$name"
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+          echo "name=$name-linux-x86_64" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/${{ steps.package.outputs.name }}.tar.gz
+          if-no-files-found: error
+
+      - name: Attach to draft release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$GITHUB_REF_NAME
+          v=${{ steps.version.outputs.version }}
+          file=${{ steps.package.outputs.tarball }}
+          # The Windows job may create the draft at the same moment: retry a few times.
+          for attempt in 1 2 3 4 5; do
+            if draft=$(gh release view "$tag" --json isDraft -q .isDraft 2>/dev/null); then
+              # Never replace a file of a release that is already published.
+              [ "$draft" = true ] || { echo "release $tag is already published"; exit 1; }
+              gh release upload "$tag" "$file" --clobber && exit 0
+            else
+              gh release create "$tag" "$file" --draft --verify-tag --title "YeOldeVST $v" \
+                --notes "YeOldeVST $v for Windows 64-bit and Linux x86_64." && exit 0
+            fi
+            sleep 10
+          done
+          echo "could not attach $file to $tag"; exit 1
 
   # macOS: YeOldeVST does not build on macOS yet. Once the port lands, remove `if: false`
   # (and the WIN32-only check in CMakeLists.txt) to get a universal build.
