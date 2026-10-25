@@ -34,6 +34,7 @@ struct TestPlugin {
   AEffect fx{};
   HostCallback host = nullptr;
   int held = 0;
+  int program = 0;  // one of kPrograms (what a host lists and switches)
   VstMidiEvent out[64];
   struct {
     int32_t numEvents;
@@ -102,9 +103,20 @@ void editorClose(TestPlugin* t) {
 }
 #endif
 
-intptr_t YOV_VSTCALL dispatcher(AEffect* e, int32_t op, int32_t, intptr_t, void* ptr, float) {
+const char* const kPrograms[] = {"Soft", "Bright", "Dark"};
+
+intptr_t YOV_VSTCALL dispatcher(AEffect* e, int32_t op, int32_t index, intptr_t value, void* ptr, float) {
   auto* t = self(e);
   switch (op) {
+    case effSetProgram:
+      if (value >= 0 && value < 3) t->program = (int)value;
+      return 0;
+    case effGetProgram: return t->program;
+    case effGetProgramName: strcpy((char*)ptr, kPrograms[t->program]); return 1;
+    case effGetProgramNameIndexed:
+      if (index < 0 || index >= 3) return 0;
+      strcpy((char*)ptr, kPrograms[index]);
+      return 1;
     case effClose:
 #if defined(YOV_TEST_EDITOR)
       editorClose(t);
@@ -188,6 +200,7 @@ YOV_EXPORT AEffect* VSTPluginMain(HostCallback host) {
   e.numOutputs = 6;
   if (const char* n = getenv("YOV_TEST_OUTPUTS")) e.numOutputs = atoi(n) > 0 ? atoi(n) : 6;
   e.numParams = 4;
+  e.numPrograms = 3;
   e.flags = effFlagsCanReplacing | effFlagsIsSynth;
 #if defined(YOV_TEST_EDITOR)
   e.flags |= effFlagsHasEditor;

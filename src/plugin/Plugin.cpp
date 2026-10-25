@@ -170,6 +170,13 @@ struct PluginGlue {
   static uint32_t latencyGet(const clap_plugin_t* p) { return self(p)->latency(); }
   static constexpr clap_plugin_latency_t latency{latencyGet};
 
+  // Program list (clap-program-list.h)
+  static uint32_t programCount(const clap_plugin_t* p) { return self(p)->programCount(); }
+  static bool programName(const clap_plugin_t* p, uint32_t i, char* name, uint32_t cap) { return self(p)->programName(i, name, cap); }
+  static int32_t programCurrent(const clap_plugin_t* p) { return self(p)->programCurrent(); }
+  static bool programSelect(const clap_plugin_t* p, uint32_t i) { return self(p)->programSelect(i); }
+  static constexpr clap_plugin_program_list_t programs{programCount, programName, programCurrent, programSelect};
+
   // tail
   static uint32_t tailGet(const clap_plugin_t* p) {
     auto h = self(p)->hosted();
@@ -294,6 +301,7 @@ bool Plugin::init() {
       static_cast<const clap_host_thread_check_t*>(host_->get_extension(host_, CLAP_EXT_THREAD_CHECK));
   hostTimer_ = static_cast<const clap_host_timer_support_t*>(host_->get_extension(host_, CLAP_EXT_TIMER_SUPPORT));
   hostFd_ = static_cast<const clap_host_posix_fd_support_t*>(host_->get_extension(host_, CLAP_EXT_POSIX_FD_SUPPORT));
+  hostPrograms_ = static_cast<const clap_host_program_list_t*>(host_->get_extension(host_, CLAP_EXT_PROGRAM_LIST));
   wrappedAsVst3_ = host_->name && containsNoCase(host_->name, "clap-as-vst3");
   Shared::get();
   logLine("instance created (%s) in host '%s'", instrument_ ? "instrument" : "effect",
@@ -376,6 +384,7 @@ const void* Plugin::getExtension(const char* id) {
   if (!std::strcmp(id, CLAP_EXT_LATENCY)) return &PluginGlue::latency;
   if (!std::strcmp(id, CLAP_EXT_TAIL)) return &PluginGlue::tail;
   if (!std::strcmp(id, CLAP_EXT_GUI)) return &PluginGlue::gui;
+  if (!std::strcmp(id, CLAP_EXT_PROGRAM_LIST)) return &PluginGlue::programs;
 #if !defined(_WIN32) && !defined(__APPLE__)
   if (!std::strcmp(id, CLAP_EXT_TIMER_SUPPORT)) return &PluginGlue::timerSupport;
   if (!std::strcmp(id, CLAP_EXT_POSIX_FD_SUPPORT)) return &PluginGlue::fdSupport;
@@ -429,6 +438,7 @@ bool Plugin::loadVst(const PluginRecord& rec, bool sandboxed, std::string& error
   crashReported_ = false;
   genericView_ = !hosted()->info().hasEditor;
   rebuildParamNames();
+  refreshPrograms(!initializing_);
   lastGoodState_ = buildStateJson();
   if (!initializing_) {
     notifyParamsChanged(true);
@@ -445,6 +455,7 @@ void Plugin::unloadVst() {
   installSlot(nullptr);
   loaded_ = PluginRecord{};
   paramNames_.clear();
+  refreshPrograms(true);
   notifyParamsChanged(true);
   if (active_) host_->request_restart(host_);
   if (hostState_) hostState_->mark_dirty(host_);
@@ -465,6 +476,42 @@ void Plugin::setProgram(int32_t index) {
     notifyParamsChanged(false);
     if (hostState_) hostState_->mark_dirty(host_);
   }
+}
+
+uint32_t Plugin::programCount() { return (uint32_t)programNames_.size(); }
+
+bool Plugin::programName(uint32_t index, char* name, uint32_t capacity) {
+  if (index >= programNames_.size() || !name || !capacity) return false;
+  std::snprintf(name, capacity, "%s", programNames_[index].c_str());
+  return true;
+}
+
+int32_t Plugin::programCurrent() {
+  auto h = hosted();
+  return h && !h->dead() && !programNames_.empty() ? h->currentProgram() : -1;
+}
+
+bool Plugin::programSelect(uint32_t index) {
+  if (index >= programNames_.size() || !hosted() || hosted()->dead()) return false;
+  setProgram((int32_t)index);
+  if (gui_) gui_->onParamsChanged();  // (its own picker shows the program too)
+  return true;
+}
+
+void Plugin::refreshPrograms(bool notify) {
+  programsReadMs_ = nowMs();
+  std::vector<std::string> names;
+  auto h = hosted();
+  // One program is no choice (most effects have a single "Default"): none, as the editor's picker shows.
+  if (h && !h->dead() && h->info().numPrograms > 1) {
+    names = h->programNames();
+    names.resize((size_t)h->info().numPrograms);
+    for (size_t i = 0; i < names.size(); ++i)
+      if (names[i].empty()) names[i] = "Program " + std::to_string(i + 1);
+  }
+  if (names == programNames_) return;
+  programNames_ = std::move(names);
+  if (notify && hostPrograms_ && hostPrograms_->changed) hostPrograms_->changed(host_);
 }
 
 void Plugin::rebuildParamNames() {
@@ -578,6 +625,9 @@ void Plugin::onMainThread() {
   }
   if (pendingDisplay_.exchange(false)) {
     rebuildParamNames();
+    // A bank loaded or a program renamed shows as a display update; some plugins send one with every
+    // parameter change, so the names are read at most once a second.
+    if (nowMs() - programsReadMs_ >= 1000) refreshPrograms(true);
     notifyParamsChanged(false);
     if (gui_) gui_->onParamsChanged();
   }
@@ -1074,6 +1124,7 @@ bool Plugin::applyStateJson(const std::string& text, std::string& error) {
       h->setParameter((int32_t)i, (float)params[i].asNumber());
   }
   rebuildParamNames();
+  refreshPrograms(!initializing_);
   notifyParamsChanged(false);
   lastGoodState_ = text;
   if (gui_) gui_->onPluginChanged();

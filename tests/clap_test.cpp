@@ -10,6 +10,8 @@
 // needs from its host. YOV_TEST_GENERIC=1 switches a loaded plugin to the generic editor.
 #include <clap/clap.h>
 
+#include "../src/plugin/clap-program-list.h"
+
 #ifdef _WIN32
 #include <windows.h>
 #include <commctrl.h>
@@ -557,6 +559,22 @@ int main(int argc, char** argv) {
     float p1 = render(a, instrument, &wav);
     printf("instance A peak: %.4f\n", p1);
     if (argc >= 6) writeWav(argv[5], wav);
+    // The hosted plugin's programs (src/plugin/clap-program-list.h): listed, and the third one selected.
+    bool programs_ok = false;
+    if (auto pl = (const clap_plugin_program_list_t*)a.p->get_extension(a.p, CLAP_EXT_PROGRAM_LIST)) {
+      const uint32_t np = pl->count(a.p);
+      std::string names;
+      for (uint32_t i = 0; i < np; ++i) {
+        char nm[64] = {};
+        pl->get_name(a.p, i, nm, sizeof nm);
+        names += std::string(i ? ", " : "") + nm;
+      }
+      const bool selected = np > 2 && pl->select(a.p, 2) && pl->current(a.p) == 2;
+      printf("programs: %u (%s), the third selected: %s\n", np, names.c_str(), selected ? "yes" : "no");
+      programs_ok = np == 0 || selected;  // (a VST2 without programs lists none)
+    } else {
+      printf("programs: no program-list extension\n");
+    }
     std::string saved = saveState(a);
     printf("state: %zu bytes: %.160s...\n", saved.size(), saved.c_str());
     a.p->destroy(a.p);
@@ -569,7 +587,7 @@ int main(int argc, char** argv) {
     printf("restored state %s original\n", saved2 == saved ? "==" : "!=");
     b.p->destroy(b.p);
     entry->deinit();
-    bool ok = p1 > 1e-4f && p2 > 1e-4f;
+    bool ok = p1 > 1e-4f && p2 > 1e-4f && programs_ok;
     printf(ok ? "PASS\n" : "FAIL\n");
     return ok ? 0 : 3;
   }

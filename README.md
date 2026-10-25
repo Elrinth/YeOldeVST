@@ -87,6 +87,8 @@ Linux, a native Linux VST2 in the Dear ImGui version of the window:
 - **DAW integration:**
   - parameter automation: up to 1024 parameters, named after the plugin's own
   - full state recall, using the chunk, or parameters plus the current program
+  - the hosted plugin's programs for the DAW's own preset browser (CLAP: the program-list extension in
+    `src/plugin/clap-program-list.h`, which MorningDAW lists and switches; the VST3 version does not offer them yet)
   - latency reporting
   - MIDI in and out, including SysEx
   - transport and tempo

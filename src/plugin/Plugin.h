@@ -6,6 +6,7 @@
 
 #include "common/PluginDb.h"
 #include "plugin/HostedPlugin.h"
+#include "plugin/clap-program-list.h"
 #include "scan/Scanner.h"
 
 #include <clap/clap.h>
@@ -58,6 +59,9 @@ class Plugin final : public HostedPlugin::Listener {
   // After a crash: start a fresh instance and restore the last known good state.
   bool reload(std::string& error);
   void setProgram(int32_t index);
+  // The hosted plugin's programs, as the host sees them (clap-program-list.h): read again after a load, a
+  // state, or a display update (at most once a second then); the host is told when they changed.
+  const std::vector<std::string>& programNames() const { return programNames_; }
   void editParameter(uint32_t index, double value);  // from the generic editor
   void beginParameterEdit(uint32_t index);
   void endParameterEdit(uint32_t index);
@@ -114,6 +118,11 @@ class Plugin final : public HostedPlugin::Listener {
   bool stateSave(const clap_ostream_t* stream);
   bool stateLoad(const clap_istream_t* stream);
   uint32_t latency();
+  uint32_t programCount();
+  bool programName(uint32_t index, char* name, uint32_t capacity);
+  int32_t programCurrent();
+  bool programSelect(uint32_t index);
+  void refreshPrograms(bool notify);
 
   // Helpers
   void handleInputEvents(const clap_input_events_t* in, Slot* slot, uint32_t frames);
@@ -141,6 +150,7 @@ class Plugin final : public HostedPlugin::Listener {
   const clap_host_thread_check_t* hostThreadCheck_ = nullptr;
   const clap_host_timer_support_t* hostTimer_ = nullptr;
   const clap_host_posix_fd_support_t* hostFd_ = nullptr;
+  const clap_host_program_list_t* hostPrograms_ = nullptr;
   bool instrument_;
   uint32_t outPairs_ = 1;
   bool wrappedAsVst3_ = false;
@@ -160,6 +170,8 @@ class Plugin final : public HostedPlugin::Listener {
   std::string missingState_;   // state of a plugin we could not find, kept verbatim
   std::string missingText_;
   std::vector<std::string> paramNames_;
+  std::vector<std::string> programNames_;
+  uint64_t programsReadMs_ = 0;
   bool genericView_ = false;
 
   // MIDI events for the current block
