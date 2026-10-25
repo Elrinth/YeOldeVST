@@ -209,8 +209,11 @@ jobs:
 
       - name: Build Steinberg VST3 validator
         run: |
-          # The SDK's Linux sample hosts need GTK 3 to configure (only the validator is built).
-          sudo apt-get install -y --no-install-recommends libgtk-3-dev
+          # The SDK's Linux sample hosts need these to configure, though only the validator is built
+          # (the list from Steinberg's Linux setup notes).
+          sudo apt-get install -y --no-install-recommends libgtkmm-3.0-dev libx11-xcb-dev libxcb-util-dev \
+            libxcb-cursor-dev libxcb-xkb-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev \
+            libcairo2-dev libsqlite3-dev libxcb-keysyms1-dev
           cmake -S external/vst3sdk -B build-vst3sdk -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DSMTG_ENABLE_VSTGUI_SUPPORT=OFF -DSMTG_ENABLE_VST3_PLUGIN_EXAMPLES=OFF
           cmake --build build-vst3sdk --target validator
