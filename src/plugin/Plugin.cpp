@@ -437,6 +437,7 @@ bool Plugin::loadVst(const PluginRecord& rec, bool sandboxed, std::string& error
   missingText_.clear();
   crashReported_ = false;
   genericView_ = !hosted()->info().hasEditor;
+  knownProgram_ = hosted()->currentProgram();
   rebuildParamNames();
   refreshPrograms(!initializing_);
   lastGoodState_ = buildStateJson();
@@ -473,6 +474,7 @@ bool Plugin::reload(std::string& error) {
 void Plugin::setProgram(int32_t index) {
   if (auto h = hosted()) {
     h->setProgram(index);
+    knownProgram_ = h->currentProgram();
     notifyParamsChanged(false);
     if (hostState_) hostState_->mark_dirty(host_);
   }
@@ -568,6 +570,8 @@ void Plugin::vstAutomate(int32_t index, float value) {
   queueOut({OutEvent::Value, (uint32_t)index, (double)value});
   if (hostParams_) hostParams_->request_flush(host_);
   if (gui_ && isMainThread()) gui_->onParamValue((uint32_t)index);
+  pendingDirty_ = true;
+  host_->request_callback(host_);
 }
 
 void Plugin::vstBeginEdit(int32_t index) {
@@ -630,7 +634,17 @@ void Plugin::onMainThread() {
     if (nowMs() - programsReadMs_ >= 1000) refreshPrograms(true);
     notifyParamsChanged(false);
     if (gui_) gui_->onParamsChanged();
+    // Another program picked in its own editor (or by MIDI): the project changed. Plugins that load a sound without
+    // reporting each parameter only show it this way.
+    if (auto h = hosted(); h && !h->dead()) {
+      const int32_t program = h->currentProgram();
+      if (program != knownProgram_) {
+        knownProgram_ = program;
+        pendingDirty_ = true;
+      }
+    }
   }
+  if (pendingDirty_.exchange(false) && hostState_) hostState_->mark_dirty(host_);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1113,11 +1127,18 @@ bool Plugin::applyStateJson(const std::string& text, std::string& error) {
   }
   auto h = hosted();
   genericView_ = j.get("genericView").asBool(!h->info().hasEditor);
-  if (j.has("program")) h->setProgram((int32_t)j.get("program").asInt());
+  // The program and the chunk in the order the plugin needs them. A bank chunk holds every program and loading it
+  // often selects the first (AIR's plugins, Sylenth1...): the saved program goes after it, or the sound picked would
+  // revert to the first program. A program chunk loads into the current program: that one is selected first. A
+  // plugin without chunks: its program, then each parameter as saved (edits made after picking the program).
+  const bool hasProgram = j.has("program");
+  const int32_t program = hasProgram ? (int32_t)j.get("program").asInt() : -1;
+  const bool bankChunk = j.has("chunk") && j.get("chunkType").asString() == "bank";
+  if (hasProgram && !bankChunk) h->setProgram(program);
   if (j.has("chunk")) {
     std::vector<uint8_t> data;
-    if (base64Decode(j.get("chunk").asString(), data) && !data.empty())
-      h->setChunk(data, j.get("chunkType").asString() != "bank");
+    if (base64Decode(j.get("chunk").asString(), data) && !data.empty()) h->setChunk(data, !bankChunk);
+    if (hasProgram && bankChunk && h->currentProgram() != program) h->setProgram(program);
   } else {
     auto& params = j.get("params").elements();
     for (size_t i = 0; i < params.size() && (int)i < h->info().numParams; ++i)
@@ -1126,6 +1147,8 @@ bool Plugin::applyStateJson(const std::string& text, std::string& error) {
   rebuildParamNames();
   refreshPrograms(!initializing_);
   notifyParamsChanged(false);
+  knownProgram_ = h->currentProgram();
+  pendingDirty_ = false;  // what it reported while it took the state back is the project's own sound
   lastGoodState_ = text;
   if (gui_) gui_->onPluginChanged();
   return true;

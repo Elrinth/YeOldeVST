@@ -61,11 +61,15 @@ jobs:
             @{ name = "multi-out, 64-bit VST2";             args = @("render", "multi", "$bin/YovTest64.dll") },
             # A plugin with far more outputs than YeOldeVST routes must not write past its buffers.
             @{ name = "128 outputs, 64-bit VST2";           args = @("render", "multi", "$bin/YovTest64.dll"); outputs = "128" },
-            @{ name = "128 outputs, 32-bit VST2 via bridge"; args = @("render", "multi", "$bin32/YovTest32.dll"); outputs = "128" }
+            @{ name = "128 outputs, 32-bit VST2 via bridge"; args = @("render", "multi", "$bin32/YovTest32.dll"); outputs = "128" },
+            # Settings as a bank chunk, whose loading selects the first program: the saved program must come back.
+            @{ name = "chunks, 64-bit VST2";                args = @("render", "instrument", "$bin/YovTest64.dll"); chunks = "1" },
+            @{ name = "chunks, 32-bit VST2 via bridge";     args = @("render", "instrument", "$bin32/YovTest32.dll"); chunks = "1" }
           )
           $failed = 0
           foreach ($c in $cases) {
             $env:YOV_TEST_OUTPUTS = $c.outputs  # read by the test plugin; empty = its default
+            $env:YOV_TEST_CHUNKS = $c.chunks
             Write-Host "::group::$($c.name)"
             $out = & $test $clap @($c.args) | Out-String
             $code = $LASTEXITCODE
@@ -191,10 +195,10 @@ jobs:
           bin=$(realpath build)
           failed=0
           echo -e "### Headless CLAP host (Linux)\n\n| Case | Result |\n|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          run_case() {  # name, outputs ("" = the test plugin's default), args...
+          run_case() {  # name, outputs ("" = the test plugin's default), args... (CHUNKS=1: settings as chunks)
             local name=$1 outs=$2; shift 2
             echo "::group::$name"
-            out=$(YOV_TEST_OUTPUTS=$outs xvfb-run -a "$bin/yov_clap_test" "$bin/YeOldeVST.clap" "$@" 2>&1); code=$?
+            out=$(YOV_TEST_OUTPUTS=$outs YOV_TEST_CHUNKS=${CHUNKS:-} xvfb-run -a "$bin/yov_clap_test" "$bin/YeOldeVST.clap" "$@" 2>&1); code=$?
             echo "$out"
             echo "::endgroup::"
             if [ $code -eq 0 ] && grep -q '^PASS' <<<"$out"; then r=PASS; else r="FAIL (exit $code)"; failed=$((failed + 1)); fi
@@ -205,6 +209,7 @@ jobs:
           run_case "effect, VST2 .so"       "" render effect "$bin/YovTest64.so"
           run_case "multi-out, VST2 .so"    "" render multi "$bin/YovTest64.so"
           run_case "128 outputs, VST2 .so"  128 render multi "$bin/YovTest64.so"
+          CHUNKS=1 run_case "chunks, VST2 .so" "" render instrument "$bin/YovTest64.so"
           [ $failed -eq 0 ] || { echo "$failed test case(s) failed"; exit 1; }
 
       - name: Build Steinberg VST3 validator

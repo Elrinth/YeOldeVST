@@ -583,6 +583,12 @@ int main(int argc, char** argv) {
     loadState(b, saved);
     float p2 = render(b, instrument, nullptr);
     printf("instance B (restored) peak: %.4f\n", p2);
+    // The program selected before saving comes back (after a bank chunk too, which selects the first program).
+    if (auto pl = (const clap_plugin_program_list_t*)b.p->get_extension(b.p, CLAP_EXT_PROGRAM_LIST); pl && pl->count(b.p) > 2) {
+      const bool back = pl->current(b.p) == 2;
+      printf("restored program: %d (%s)\n", pl->current(b.p), back ? "the one saved" : "NOT the one saved");
+      programs_ok = programs_ok && back;
+    }
     std::string saved2 = saveState(b);
     printf("restored state %s original\n", saved2 == saved ? "==" : "!=");
     b.p->destroy(b.p);

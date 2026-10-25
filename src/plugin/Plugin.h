@@ -201,6 +201,10 @@ class Plugin final : public HostedPlugin::Listener {
   void emitMidiOut(const clap_output_events_t* out, uint32_t frames);
 
   std::atomic<bool> pendingCrash_{false}, pendingIO_{false}, pendingDisplay_{false};
+  // The hosted plugin changed itself (audioMasterAutomate from its editor): the host is told its state changed
+  // (clap_host_state.mark_dirty) on the main thread, so the DAW knows the project has something to save.
+  std::atomic<bool> pendingDirty_{false};
+  int32_t knownProgram_ = -1;  // its program as last seen: another one after a display update is a change too
   std::atomic<uint32_t> pendingSize_{0};
   bool crashReported_ = false;
 

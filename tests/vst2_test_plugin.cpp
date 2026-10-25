@@ -104,6 +104,8 @@ void editorClose(TestPlugin* t) {
 #endif
 
 const char* const kPrograms[] = {"Soft", "Bright", "Dark"};
+float gParams[4] = {};
+float gChunk[4] = {};  // what effGetChunk hands out (it stays valid until the next call)
 
 intptr_t YOV_VSTCALL dispatcher(AEffect* e, int32_t op, int32_t index, intptr_t value, void* ptr, float) {
   auto* t = self(e);
@@ -116,6 +118,17 @@ intptr_t YOV_VSTCALL dispatcher(AEffect* e, int32_t op, int32_t index, intptr_t 
     case effGetProgramNameIndexed:
       if (index < 0 || index >= 3) return 0;
       strcpy((char*)ptr, kPrograms[index]);
+      return 1;
+    // YOV_TEST_CHUNKS=1: its settings travel as chunks (the parameters), and loading a bank selects the first
+    // program, as many plugins do (AIR's, Sylenth1): a host must select the saved program after the bank.
+    case effGetChunk:
+      memcpy(gChunk, gParams, sizeof gChunk);
+      *(void**)ptr = gChunk;
+      return (intptr_t)sizeof gChunk;
+    case effSetChunk:
+      if (value != (intptr_t)sizeof gChunk || !ptr) return 0;
+      memcpy(gParams, ptr, sizeof gParams);
+      if (index == 0) t->program = 0;
       return 1;
     case effClose:
 #if defined(YOV_TEST_EDITOR)
@@ -176,7 +189,6 @@ void YOV_VSTCALL processReplacing(AEffect* e, float**, float** outs, int32_t fra
 
 // Like some old plugins, reports every change straight back to the host (an "echo"), and keeps
 // the value so a test can read it back.
-float gParams[4] = {};
 void YOV_VSTCALL setParameter(AEffect* e, int32_t i, float v) {
   if (i < 0 || i >= 4) return;
   gParams[i] = v;
@@ -202,6 +214,7 @@ YOV_EXPORT AEffect* VSTPluginMain(HostCallback host) {
   e.numParams = 4;
   e.numPrograms = 3;
   e.flags = effFlagsCanReplacing | effFlagsIsSynth;
+  if (const char* c = getenv("YOV_TEST_CHUNKS"); c && atoi(c) > 0) e.flags |= effFlagsProgramChunks;
 #if defined(YOV_TEST_EDITOR)
   e.flags |= effFlagsHasEditor;
 #endif
