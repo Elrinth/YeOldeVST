@@ -253,7 +253,7 @@ jobs:
         run: |
           bin=$(realpath build)
           # Every CC, aftertouch and bend on every channel, sent the VST3 way (IMidiMapping).
-          xvfb-run -a "$bin/yov_vst3_midi_test" "$bin/YeOldeVST.vst3/Contents/x86_64-linux/YeOldeVST.so" "$bin/YovTest64.so"
+          xvfb-run -a "$bin/yov_vst3_midi_test" "$bin/Release/YeOldeVST.vst3/Contents/x86_64-linux/YeOldeVST.so" "$bin/YovTest64.so"
 
       - name: Build Steinberg VST3 validator
         run: |
