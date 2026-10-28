@@ -741,7 +741,11 @@ void Plugin::handleInputEvents(const clap_input_events_t* in, Slot* slot, uint32
       }
       case CLAP_EVENT_MIDI: {
         auto ev = reinterpret_cast<const clap_event_midi_t*>(hdr);
-        addMidi(hdr->time, ev->data[0], ev->data[1], ev->data[2]);
+        // Data bytes are 7-bit. A host (or a wrapper) that scales a full controller to 128, or a
+        // full bend to 16384, would otherwise hand the VST2 an invalid value (sustain off, bend
+        // wrapping to centre): keep it at the top of the range instead.
+        auto data = [&](int i) { return ev->data[i] > 127 ? uint8_t(127) : ev->data[i]; };
+        addMidi(hdr->time, ev->data[0], data(1), data(2));
         break;
       }
       case CLAP_EVENT_MIDI_SYSEX: {

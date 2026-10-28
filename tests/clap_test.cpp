@@ -153,9 +153,50 @@ static int64_t bufWrite(const clap_ostream_t* s, const void* in, uint64_t n) {
 }
 
 // ---- events ----
-struct EventList {
-  std::vector<clap_event_note_t> notes;
+union AnyEvent {
+  clap_event_header_t header;
+  clap_event_note_t note;
+  clap_event_midi_t midi;
+  clap_event_note_expression_t expr;
 };
+struct EventList {
+  std::vector<AnyEvent> notes;
+};
+
+// YOV_TEST_SEND: extra events sent while the note is held, comma separated. Six hex digits are a
+// raw MIDI message ("E07F7F" = full bend up, "B0407F" = sustain down); "T<semitones>" is a CLAP
+// note expression (tuning) on the held note, as hosts send per-note bends.
+static void addTestEvents(EventList& evs, uint32_t time) {
+  const char* spec = getenv("YOV_TEST_SEND");
+  if (!spec) return;
+  std::string s = spec;
+  size_t pos = 0;
+  while (pos < s.size()) {
+    size_t end = s.find(',', pos);
+    std::string tok = s.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+    pos = end == std::string::npos ? s.size() : end + 1;
+    AnyEvent a{};
+    if (!tok.empty() && tok[0] == 'T') {
+      a.expr.header = {sizeof(clap_event_note_expression_t), time, CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_NOTE_EXPRESSION, 0};
+      a.expr.expression_id = CLAP_NOTE_EXPRESSION_TUNING;
+      a.expr.note_id = -1;
+      a.expr.port_index = 0;
+      a.expr.channel = 0;
+      a.expr.key = 57;
+      a.expr.value = atof(tok.c_str() + 1);
+    } else if (tok.size() == 6) {
+      unsigned v = (unsigned)strtoul(tok.c_str(), nullptr, 16);
+      a.midi.header = {sizeof(clap_event_midi_t), time, CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_MIDI, 0};
+      a.midi.port_index = 0;
+      a.midi.data[0] = uint8_t(v >> 16);
+      a.midi.data[1] = uint8_t(v >> 8);
+      a.midi.data[2] = uint8_t(v);
+    } else {
+      continue;
+    }
+    evs.notes.push_back(a);
+  }
+}
 static uint32_t evSize(const clap_input_events_t* l) { return (uint32_t)((EventList*)l->ctx)->notes.size(); }
 static const clap_event_header_t* evGet(const clap_input_events_t* l, uint32_t i) {
   return &((EventList*)l->ctx)->notes[i].header;
@@ -280,8 +321,11 @@ static float render(Instance& in, bool instrument, std::vector<float>* wav) {
       n.channel = 0;
       n.key = key;
       n.velocity = 0.8;
-      evs.notes.push_back(n);
+      AnyEvent a{};
+      a.note = n;
+      evs.notes.push_back(a);
     };
+    if (b == 6) addTestEvents(evs, 0);
     if (b == 2) {
       note(CLAP_EVENT_NOTE_ON, 57);
       note(CLAP_EVENT_NOTE_ON, 64);

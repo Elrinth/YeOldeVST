@@ -118,12 +118,12 @@ the VST3 build gets them from the host's run loop).
 Download the build for your system from the
 [Releases page](https://github.com/Elrinth/YeOldeVST/releases) and unpack it.
 
-**Windows** (`YeOldeVST-1.4.1-win64.zip`): copy `YeOldeVST.clap` to
+**Windows** (`YeOldeVST-1.4.2-win64.zip`): copy `YeOldeVST.clap` to
 `%LOCALAPPDATA%\Programs\Common\CLAP` or `C:\Program Files\Common Files\CLAP`. Copy the
 `YeOldeVST.vst3` folder to `%LOCALAPPDATA%\Programs\Common\VST3` or
 `C:\Program Files\Common Files\VST3`.
 
-**Linux** (`YeOldeVST-1.4.1-linux-x86_64.tar.gz`, x86_64, glibc 2.35 or newer: Ubuntu 22.04,
+**Linux** (`YeOldeVST-1.4.2-linux-x86_64.tar.gz`, x86_64, glibc 2.35 or newer: Ubuntu 22.04,
 Debian 12, Fedora 36 and later): copy `YeOldeVST.clap` to `~/.clap` (or `/usr/lib/clap`) and the
 `YeOldeVST.vst3` folder to `~/.vst3` (or `/usr/lib/vst3`). It hosts native Linux VST2 plugins
 (`.so`); the usual Linux VST2 folders that exist (`~/.vst`, `~/.lxvst`, `/usr/lib/vst`,

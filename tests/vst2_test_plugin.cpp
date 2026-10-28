@@ -152,6 +152,15 @@ intptr_t YOV_VSTCALL dispatcher(AEffect* e, int32_t op, int32_t index, intptr_t 
       for (int i = 0; i < evs->numEvents && n < 64; ++i) {
         if (evs->events[i]->type != kVstMidiType) continue;
         auto* m = reinterpret_cast<VstMidiEvent*>(evs->events[i]);
+        // YOV_TEST_MIDI_LOG=<file>: every MIDI message as it arrives (status d1 d2 @ frame), so a
+        // test can check exactly what reached the plugin (bend, controllers, notes).
+        if (const char* path = getenv("YOV_TEST_MIDI_LOG")) {
+          if (FILE* f = fopen(path, "a")) {
+            fprintf(f, "%02X %02X %02X @%d\n", (uint8_t)m->midiData[0], (uint8_t)m->midiData[1], (uint8_t)m->midiData[2],
+                    m->deltaFrames);
+            fclose(f);
+          }
+        }
         uint8_t st = (uint8_t)m->midiData[0] & 0xF0;
         bool on = st == 0x90 && m->midiData[2] != 0;
         bool off = st == 0x80 || (st == 0x90 && m->midiData[2] == 0);

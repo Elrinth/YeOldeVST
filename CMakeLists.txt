@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(YeOldeVST VERSION 1.4.1 LANGUAGES C CXX)
+project(YeOldeVST VERSION 1.4.2 LANGUAGES C CXX)
 
 # Windows hosts Windows VST2 DLLs (32-bit ones through a helper), Linux hosts Linux VST2 .so
 # plugins. macOS support is prepared in the platform layer but not finished.

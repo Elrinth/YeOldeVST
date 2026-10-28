@@ -84,6 +84,27 @@ jobs:
           Get-Content $env:TEMP/results.md >> $env:GITHUB_STEP_SUMMARY
           if ($failed) { throw "$failed test case(s) failed" }
 
+      - name: Test MIDI pass-through (bend, sustain)
+        timeout-minutes: 5
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false # exit codes are checked below
+          $bin = Resolve-Path build/Release
+          $bin32 = Resolve-Path build/host32/Release
+          # Full bend up and sustain on must reach the VST2 unchanged; out-of-range data bytes
+          # (a host scaling a full controller to 128) must arrive clamped to 127.
+          $env:YOV_TEST_SEND = "E07F7F,B0407F,B04080"
+          foreach ($dll in @("$bin/YovTest64.dll", "$bin32/YovTest32.dll")) {
+            $log = "$env:TEMP/yov_midi.log"
+            Remove-Item $log -ErrorAction SilentlyContinue
+            $env:YOV_TEST_MIDI_LOG = $log
+            & "$bin/yov_clap_test.exe" "$bin/YeOldeVST.clap" render instrument $dll | Out-Null
+            $got = Get-Content $log -ErrorAction SilentlyContinue | Where-Object { $_ -match '^[BE]' }
+            Write-Host "$dll`n$($got -join "`n")"
+            if (-not ($got -match '^E0 7F 7F') -or -not ($got -match '^B0 40 7F') -or ($got -match ' 80 ')) {
+              throw "MIDI did not reach $dll intact"
+            }
+          }
+
       - name: Build Steinberg VST3 validator
         run: |
           cmake -S external/vst3sdk -B build-vst3sdk -G "Visual Studio 17 2022" -A x64 `
