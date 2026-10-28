@@ -103,6 +103,15 @@ void editorClose(TestPlugin* t) {
 }
 #endif
 
+// YOV_TEST_MIDI_LOG=<file>, opened for appending on first use; null when unset.
+FILE* midiLog() {
+  static FILE* f = [] {
+    const char* path = getenv("YOV_TEST_MIDI_LOG");
+    return path && *path ? fopen(path, "a") : nullptr;
+  }();
+  return f;
+}
+
 const char* const kPrograms[] = {"Soft", "Bright", "Dark"};
 float gParams[4] = {};
 float gChunk[4] = {};  // what effGetChunk hands out (it stays valid until the next call)
@@ -154,12 +163,10 @@ intptr_t YOV_VSTCALL dispatcher(AEffect* e, int32_t op, int32_t index, intptr_t 
         auto* m = reinterpret_cast<VstMidiEvent*>(evs->events[i]);
         // YOV_TEST_MIDI_LOG=<file>: every MIDI message as it arrives (status d1 d2 @ frame), so a
         // test can check exactly what reached the plugin (bend, controllers, notes).
-        if (const char* path = getenv("YOV_TEST_MIDI_LOG")) {
-          if (FILE* f = fopen(path, "a")) {
-            fprintf(f, "%02X %02X %02X @%d\n", (uint8_t)m->midiData[0], (uint8_t)m->midiData[1], (uint8_t)m->midiData[2],
-                    m->deltaFrames);
-            fclose(f);
-          }
+        // The file stays open (opening it per message is slow enough for the bridge to drop blocks).
+        if (FILE* f = midiLog()) {
+          fprintf(f, "%02X %02X %02X @%d\n", (uint8_t)m->midiData[0], (uint8_t)m->midiData[1], (uint8_t)m->midiData[2],
+                  m->deltaFrames);
         }
         uint8_t st = (uint8_t)m->midiData[0] & 0xF0;
         bool on = st == 0x90 && m->midiData[2] != 0;
@@ -172,6 +179,7 @@ intptr_t YOV_VSTCALL dispatcher(AEffect* e, int32_t op, int32_t index, intptr_t 
         o.midiData[1] = (char)(m->midiData[1] + 12);
         t->outList.events[n++] = reinterpret_cast<VstEvent*>(&o);
       }
+      if (FILE* f = midiLog()) fflush(f);
       t->outList.numEvents = n;
       if (n && t->host) t->host(e, audioMasterProcessEvents, 0, 0, &t->outList, 0);
       return 1;

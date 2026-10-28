@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(YeOldeVST VERSION 1.4.2 LANGUAGES C CXX)
+project(YeOldeVST VERSION 1.4.3 LANGUAGES C CXX)
 
 # Windows hosts Windows VST2 DLLs (32-bit ones through a helper), Linux hosts Linux VST2 .so
 # plugins. macOS support is prepared in the platform layer but not finished.
@@ -258,6 +258,37 @@ else()
 endif()
 # clap-wrapper's sources are C++17 (u8string / fmt pointer formatting changed in C++20).
 set_target_properties(yov_vst3-clap-wrapper-vst3-lib PROPERTIES CXX_STANDARD 17)
+# clap-wrapper truncates a VST3 MIDI controller value to an integer. From a host that keeps values
+# in float precision, sustain 64 then arrives as 63 (pedal up) and a centred bend as 8191. Build
+# a copy of its VST3 process.cpp that rounds instead (the submodule itself stays untouched).
+set(_cw_process ${CMAKE_SOURCE_DIR}/external/clap-wrapper/src/detail/vst3/process.cpp)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_cw_process})
+file(READ ${_cw_process} _cw_src)
+set(_cw_rounded "${_cw_src}")
+string(REPLACE "n.midi.data[1] = param->asClapValue(value);"
+               "n.midi.data[1] = (uint8_t)(param->asClapValue(value) + 0.5);" _cw_rounded "${_cw_rounded}")
+string(REPLACE "auto val = (uint16_t)param->asClapValue(value);"
+               "auto val = (uint16_t)(param->asClapValue(value) + 0.5);" _cw_rounded "${_cw_rounded}")
+string(REPLACE "n.midi.data[2] = param->asClapValue(value);"
+               "n.midi.data[2] = (uint8_t)(param->asClapValue(value) + 0.5);" _cw_rounded "${_cw_rounded}")
+string(REGEX MATCHALL "asClapValue\\(value\\) \\+ 0\\.5\\)" _cw_before "${_cw_src}")
+string(REGEX MATCHALL "asClapValue\\(value\\) \\+ 0\\.5\\)" _cw_after "${_cw_rounded}")
+list(LENGTH _cw_before _cw_n0)
+list(LENGTH _cw_after _cw_n1)
+math(EXPR _cw_count "${_cw_n1} - ${_cw_n0}")
+if(NOT _cw_count EQUAL 4)
+  message(FATAL_ERROR "clap-wrapper's MIDI controller code changed; update the rounding in CMakeLists.txt")
+endif()
+# The copy lives in the build tree: point its own includes back at the originals.
+set(_cw_dir ${CMAKE_SOURCE_DIR}/external/clap-wrapper/src/detail/vst3)
+string(REPLACE "#include \"process.h\"" "#include \"${_cw_dir}/process.h\"" _cw_rounded "${_cw_rounded}")
+string(REPLACE "#include \"parameter.h\"" "#include \"${_cw_dir}/parameter.h\"" _cw_rounded "${_cw_rounded}")
+string(REPLACE "#include \"../clap/" "#include \"${_cw_dir}/../clap/" _cw_rounded "${_cw_rounded}")
+set(_cw_patched ${CMAKE_BINARY_DIR}/clap-wrapper-patched/vst3_process.cpp)
+file(CONFIGURE OUTPUT ${_cw_patched} CONTENT "${_cw_rounded}" @ONLY)
+get_target_property(_cw_sources yov_vst3-clap-wrapper-vst3-lib SOURCES)
+list(TRANSFORM _cw_sources REPLACE ".*/src/detail/vst3/process\\.cpp$" ${_cw_patched})
+set_target_properties(yov_vst3-clap-wrapper-vst3-lib PROPERTIES SOURCES "${_cw_sources}")
 if(NOT MSVC AND TARGET clap-wrapper-compile-options)
   # It builds with -Werror; this VST3 SDK deprecates functions it still calls.
   get_target_property(_cw_opts clap-wrapper-compile-options INTERFACE_COMPILE_OPTIONS)
@@ -271,6 +302,18 @@ if(NOT WIN32 AND NOT APPLE AND TARGET base-sdk-vst3)
 endif()
 
 # --- tests ------------------------------------------------------------------------------------
+# A VST3 host that sends MIDI controllers the VST3 way (IMidiMapping parameters).
+add_executable(yov_vst3_midi_test tests/vst3_midi_test.cpp
+  ${VST3_SDK_ROOT}/pluginterfaces/base/funknown.cpp
+  ${VST3_SDK_ROOT}/pluginterfaces/base/coreiids.cpp
+  ${VST3_SDK_ROOT}/public.sdk/source/vst/vstinitiids.cpp
+  ${VST3_SDK_ROOT}/public.sdk/source/vst/hosting/parameterchanges.cpp)
+target_include_directories(yov_vst3_midi_test PRIVATE ${VST3_SDK_ROOT})
+set_target_properties(yov_vst3_midi_test PROPERTIES CXX_STANDARD 17)
+if(NOT WIN32)
+  target_link_libraries(yov_vst3_midi_test PRIVATE ${CMAKE_DL_LIBS})
+endif()
+
 add_executable(yov_clap_test tests/clap_test.cpp)
 target_link_libraries(yov_clap_test PRIVATE clap)
 if(WIN32)

@@ -105,6 +105,21 @@ jobs:
             }
           }
 
+      - name: Test MIDI controllers through the VST3
+        timeout-minutes: 5
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false # exit codes are checked below
+          $bin = Resolve-Path build/Release
+          $bin32 = Resolve-Path build/host32/Release
+          # Every CC, aftertouch and bend on every channel, sent the VST3 way (IMidiMapping).
+          $vst3 = "$bin/YeOldeVST.vst3/Contents/x86_64-win/YeOldeVST.vst3"
+          foreach ($dll in @("$bin/YovTest64.dll", "$bin32/YovTest32.dll")) {
+            $out = & "$bin/yov_vst3_midi_test.exe" $vst3 $dll | Out-String
+            $code = $LASTEXITCODE
+            Write-Host $out
+            if ($code -ne 0 -or $out -notmatch '(?m)^PASS\s*$') { throw "VST3 MIDI controllers did not reach $dll intact" }
+          }
+
       - name: Build Steinberg VST3 validator
         run: |
           cmake -S external/vst3sdk -B build-vst3sdk -G "Visual Studio 17 2022" -A x64 `
@@ -232,6 +247,13 @@ jobs:
           run_case "128 outputs, VST2 .so"  128 render multi "$bin/YovTest64.so"
           CHUNKS=1 run_case "chunks, VST2 .so" "" render instrument "$bin/YovTest64.so"
           [ $failed -eq 0 ] || { echo "$failed test case(s) failed"; exit 1; }
+
+      - name: Test MIDI controllers through the VST3
+        timeout-minutes: 5
+        run: |
+          bin=$(realpath build)
+          # Every CC, aftertouch and bend on every channel, sent the VST3 way (IMidiMapping).
+          xvfb-run -a "$bin/yov_vst3_midi_test" "$bin/YeOldeVST.vst3/Contents/x86_64-linux/YeOldeVST.so" "$bin/YovTest64.so"
 
       - name: Build Steinberg VST3 validator
         run: |
