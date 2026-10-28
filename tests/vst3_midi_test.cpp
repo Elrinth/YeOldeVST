@@ -225,6 +225,16 @@ int main(int argc, char** argv) {
   processor->release();
   component->terminate();
   component->release();
+  factory->release();
+  // Unload the way a host does: the module's exit function stops what the plugin keeps running.
+#if defined(_WIN32)
+  if (auto exitDll = (InitFn)GetProcAddress(mod, "ExitDll")) exitDll();
+  FreeLibrary(mod);
+#else
+  using ExitFn = bool (*)();
+  if (auto exit = (ExitFn)dlsym(mod, "ModuleExit")) exit();
+  dlclose(mod);
+#endif
 
   // Compare as multisets: the order of controllers within a block is the host's business.
   auto got = readLog(log);
